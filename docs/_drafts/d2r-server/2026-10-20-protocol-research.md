@@ -1,230 +1,233 @@
-# D2R Server: Protocol and Runtime Evidence
+# D2R 服务器：协议与运行时证据
 
-Date: 2026-10-20  
-Status: companion research report; implementation feasibility remains gated  
-Design: [private four-player server proposal](2026-10-20-d2r-server-design.md)  
-Source baseline: `120fe55c02a5633476998a44f8c3c3c809fa48b0` (`v1.0.18`)
+日期：2026-10-20
 
-## Scope and conclusion
+状态：配套调研报告；实现可行性仍需通过验证门槛
 
-The hard-confirmed requirements are **four players per room**, modified iPhone clients, and a Linux/Docker deployment. **Every room admission imports the selected character from that phone's local save**; a server-owned permanent character roster is outside scope. Compatibility with unmodified official clients and reproduction of Battle.net services are also outside scope. The server CPU remains undecided: both x86_64 Linux and arm64 Linux must be compared. The network protocol itself is independent of CPU instruction set; executing an original game binary introduces the ISA dependency.
+设计：[四人私有服务器提案](2026-10-20-d2r-server-design.md)
 
-The source supports a credible research direction: retain the guest's game simulation as the room authority and connect modified clients through a transport owned by this project. It does not yet demonstrate a network-ready server. Existing command capture/replay proves a useful internal command boundary, while shipped-artifact inspection establishes the packaging and address mapping needed for further analysis. Neither establishes a complete wire protocol, a headless Linux game lifecycle, or four-player admission.
+源码基线：`120fe55c02a5633476998a44f8c3c3c809fa48b0`（`v1.0.18`）
 
-The preferred candidate combines two separate decisions: **guest simulation reuse** for game rules and **a new authenticated transport** for the modified clients. The implementation proposal must remain conditional on the gates below.
+## 范围与结论
 
-## Evidence classification
+已明确确认的硬性要求是：**每个房间四人**、允许修改 iPhone 客户端，以及部署到 Linux/Docker。**每次进入房间时，都从该手机的本地存档导入所选角色**；由服务器永久管理角色列表不在范围内。兼容未修改的官方客户端、复现 Battle.net 服务也不在范围内。服务器 CPU 尚未确定，需要比较 x86_64 Linux 和 arm64 Linux。网络协议本身不依赖 CPU 指令集；运行原游戏二进制时，才会引入指令集依赖。
 
-This report distinguishes four kinds of evidence:
+源码支持一个可信的调研方向：保留 guest 的游戏模拟作为房间的权威游戏逻辑（由服务器统一裁决），并通过本项目自行实现的传输层连接修改后的客户端。目前尚未证明它能成为可联网的服务器。现有指令录制/回放证明了一个有用的内部指令边界；已发布程序的检查则确认了进一步分析所需的封装方式和地址映射。两者都尚未确立完整的线上协议、无图形界面的 Linux 游戏生命周期，或四人入房能力。
 
-- **Source fact:** executable statements or declared contracts in the baseline repository. Comments are identified separately when they provide interpretation rather than an independently reproduced result.
-- **Shipped-artifact observation:** a bounded result from the signed Guest binary, recorded with an evidence identifier or a reproducible derivation manifest.
-- **External author claim or contract:** primary documentation from the author of another project. This is useful precedent, not an independently executed compatibility test.
-- **Inference / open question:** an architectural consequence or an unproved hypothesis requiring further work.
+优先候选方案结合两个独立决策：游戏规则采用**复用 guest 游戏模拟**，修改后的客户端采用**新的认证传输层**。实现提案必须以下述验证门槛通过为前提。
 
-All original game offsets below are relative to the guest `main` image for the version used by this source baseline. They are not Mach-O file offsets, host process addresses, recovered original symbols, or portable addresses for other game builds.
+## 证据分类
 
-## What the internal command path establishes
+本报告区分四类证据：
 
-The current project observes and manipulates the local game's client-to-server command path:
+- **源码事实：**基线仓库中的可执行语句或已声明契约。如果注释提供的是解释，而非独立复现的结果，会单独说明。
+- **已发布程序观察：**对签名 Guest 二进制进行限定范围分析所得的结果，附证据标识符或可复现的派生清单。
+- **外部作者声明或契约：**其他项目作者的一手文档。这些是有价值的先例，并非本项目独立执行的兼容性测试。
+- **推断 / 待解问题：**架构上的推论，或需要后续工作验证的假设。
 
-| Anchor | Evidence and bounded meaning |
+下文所有原游戏偏移都相对于本源码基线使用版本的 guest `main` 映像。它们不是 Mach-O 文件偏移、宿主进程地址、恢复出的原始符号，也不是可用于其他游戏构建的通用地址。
+
+## 内部指令路径能证明什么
+
+当前项目观察并操作本地游戏的客户端到服务器（C2S）指令路径：
+
+| 锚点 | 证据及其适用范围 |
 |---|---|
-| `main+0x2ceab0` | Source sender calls appear in `dm/host/dm_actions.c:797–803`. Focused REA/Ghidra analysis now confirms this entry's size guard, optional progress send, duplicate-suppression branch and byte-range dispatch through the inline object `main+0x2d9f438`, virtual method `+0x30`. Its concrete transport implementation remains unknown. See the REA evidence below. |
-| `main+0x5d3960` | Receive pump identified by the packet format documentation and `diag.c` comments. It has separate system-message and gameplay-command delivery paths. |
-| `main+0x5d3a88` → `0x632510` | Host rewrite `SVC_HOST_C2S_DELIVER`; `diag.c:1316–1339` forwards or applies product rules. Focused REA now confirms that the receiver uses the prefixed client ID to find connection, game and player before dispatch. It advances the data pointer by four bytes while forwarding the length argument unchanged; the length/framing contract remains unknown. |
-| `main+0x6e5b40` | Gameplay command dispatcher. `diag.c:1154–1177` reads game, sender unit, packet pointer, length, and tick for capture. `:1378–1394` injects recorded commands into this dispatcher. |
-| `main+0x6310b0` | System-message dispatcher. `diag.c:1233–1239` captures the message without the leading local client number; `:1381–1387` reconstructs the local envelope during replay. |
-| `main+0x20a4190`, `0x1daf73c` | Gameplay and system dispatch tables identified in `dm/verify/command_packet_format.md`. Their complete entries and actual coverage have not been independently recovered in this research. |
+| `main+0x2ceab0` | 源码中的发送调用位于 `dm/host/dm_actions.c:797–803`。聚焦的 REA/Ghidra 分析现已确认此入口的长度限制、可选进度消息发送、重复抑制分支，以及通过内嵌对象 `main+0x2d9f438` 的虚方法 `+0x30` 分发字节范围。具体传输实现仍未知。见下文 REA 证据。 |
+| `main+0x5d3960` | 数据包格式文档和 `diag.c` 注释标出的接收循环。它分别处理系统消息和游戏指令的交付。 |
+| `main+0x5d3a88` → `0x632510` | 宿主重写点 `SVC_HOST_C2S_DELIVER`；`diag.c:1316–1339` 负责转发或应用产品规则。聚焦 REA 分析现已确认，接收函数会根据前缀中的客户端 ID 查找连接、游戏和玩家，再进行分发。它将数据指针前移四字节，同时原样传递长度参数；长度/分帧契约仍未知。 |
+| `main+0x6e5b40` | 游戏指令分发器。`diag.c:1154–1177` 读取游戏、发送者单位、数据包指针、长度和 tick，用于录制。`:1378–1394` 将录制的指令注入此分发器。 |
+| `main+0x6310b0` | 系统消息分发器。`diag.c:1233–1239` 录制消息时去掉开头的本地客户端编号；`:1381–1387` 在回放时重建本地封装。 |
+| `main+0x20a4190`, `0x1daf73c` | `dm/verify/command_packet_format.md` 标出的游戏指令表和系统消息分发表。本次调研尚未独立恢复完整表项及其实际覆盖范围。 |
 
-The source distinction between the dispatcher payload and receive envelope matters. `c2s_obs` reads the command number from the first payload byte. `c2s_deliver` reads it at offset four of its receive buffer (`diag.c:1325–1333`). The system capture explicitly omits a leading four-byte client number. Focused receiver decompilation independently confirms a leading client ID on that gameplay receive path. It does not prove that these four bytes are part of a remote wire frame: the receiver advances its pointer by four while passing its length argument unchanged. Copying one observed buffer shape into a network stream would therefore conflate at least two layers.
+源码区分分发器载荷和接收封装，这一点很重要。`c2s_obs` 从载荷的第一个字节读取指令编号。`c2s_deliver` 从接收缓冲区偏移四的位置读取（`diag.c:1325–1333`）。系统消息录制明确省略了开头的四字节客户端编号。聚焦的接收函数反编译独立确认，该游戏指令接收路径带有前置客户端 ID。但这不能证明这四字节属于远程线上帧：接收函数将指针前移四字节，却原样传递长度参数。因此，直接把观察到的一种缓冲区结构复制进网络流，会混淆至少两个层次。
 
-The replay implementation has narrower capabilities than a multiplayer transport:
+回放实现的能力范围小于多人传输层：
 
-- It runs within an existing local game, obtains one remembered game pointer and one local system client number (`diag.c:1151–1153`), and looks up units in that game's tables.
-- It injects system messages before gameplay commands for the same recorded tick (`:1384–1394`).
-- It depends on a locally initialized player/game lifecycle. It does not create four authenticated peer contexts or bind remote peers to their own units.
-- Capture retains at most 512 payload bytes (`:1158`, `:1236`); the replay loader rejects a recorded length that does not match the available bytes (`:1416`). Separately, focused REA confirms `param_2 < 0x200` in the particular sender entry `0x2ceab0`. Neither the diagnostic ceiling nor this entry-local guard establishes a universal wire-frame maximum.
-- The observation callback also invokes boss-rush, rift, pouch, and vendor feature hooks (`:1159–1163`). It is not a passive networking abstraction.
+- 它在已经存在的本地游戏中运行，使用一个记住的游戏指针和一个本地系统客户端编号（`diag.c:1151–1153`），并在该游戏的表中查找单位。
+- 对于同一个录制 tick，它先注入系统消息，再注入游戏指令（`:1384–1394`）。
+- 它依赖本地已初始化的玩家/游戏生命周期。它不会创建四个经过认证的对等连接上下文，也不会把远程连接绑定到各自的单位。
+- 录制最多保留 512 字节载荷（`:1158`, `:1236`）；回放加载器会拒绝录制长度与可用字节数不符的数据（`:1416`）。另外，聚焦 REA 分析确认，特定发送入口 `0x2ceab0` 中存在 `param_2 < 0x200` 条件。诊断录制上限和该入口的局部限制，都不能确立通用的线上帧最大长度。
+- 观察回调还会调用 boss-rush、rift、pouch 和 vendor 功能钩子（`:1159–1163`）。它不是被动的网络抽象层。
 
-The source facts and bounded artifact observations support a candidate bridge seam. Whether it can support a complete custom transport remains an inference. Remote admission, flow control, complete framing, lifecycle completion and recipient routing remain open.
+这些源码事实和限定范围的程序观察支持一个候选桥接边界。它能否承载完整的自定义传输层，仍属推断。远程入房、流量控制、完整分帧、生命周期闭环和接收者路由仍待解决。
 
-Source permalink: [capture, delivery and replay in diag.c](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/host/diag.c#L1138).
+源码永久链接：[diag.c 中的录制、交付与回放](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/host/diag.c#L1138)。
 
-## S2C evidence is currently partial
+## 服务器到客户端的证据目前仍不完整
 
-The strongest source-level generic send evidence is `dm/host/dm_elysium.c:325–339`. Its executable `stash_gold_notify` function obtains a connection object from `[[player+0x10]+0xf0]`, takes the **object address** `main+0x2d7f3d8`, resolves that object's virtual method at `+0x28`, and invokes it with the object, the connection's client number and a `{begin,end}` byte range. In particular, `main+0x2d7f3d8` is the object itself, **not a pointer slot that should be dereferenced once first**. The source emits an acknowledgement when needed and a stat notification through this same method.
+最有力的源码级通用发送证据位于 `dm/host/dm_elysium.c:325–339`。其可执行函数 `stash_gold_notify` 从 `[[player+0x10]+0xf0]` 获取连接对象，取得**对象地址** `main+0x2d7f3d8`，解析该对象位于 `+0x28` 的虚方法，然后以对象、连接的客户端编号及 `{begin,end}` 字节范围为参数调用它。特别要注意，`main+0x2d7f3d8` 就是对象本身，**不是需要先解引用一次的指针槽位**。源码在需要时发送确认消息，并通过同一方法发送属性通知。
 
-This is concrete source evidence for a per-client generic sending seam. The **concrete offline vtable implementation remains unknown**. The source passes stack-backed byte ranges, so the send implementation must be understood before deciding when a bridge copies, retains or releases a buffer. A virtual method call does not by itself identify the remote wire format or prove synchronous copying.
+这是逐客户端通用发送边界的具体源码证据。**离线模式的具体虚表实现仍未知**。源码传入的是栈上的字节范围，因此必须先理解发送实现，才能决定桥接层何时复制、保留或释放缓冲区。仅凭虚方法调用，无法识别远程线上格式，也不能证明它会同步复制数据。
 
-Other host features call original routines to notify the local client after authoritative inventory changes. `dm/host/dm_vault.c:171,217`, `dm_pages.c:240–244`, and `dm_pouch.c:160,179` call `main+0x642f70` with game, player and item information. These are representative original notification builders, not a recovered complete outbound codec.
+其他宿主功能会在服务器统一裁决的物品栏变更后，调用原游戏例程通知本地客户端。`dm/host/dm_vault.c:171,217`、`dm_pages.c:240–244` 和 `dm_pouch.c:160,179` 以游戏、玩家和物品信息为参数调用 `main+0x642f70`。这些是原游戏通知构造器的代表实例，并不构成已恢复的完整发送编码器。
 
-Source-derived analysis anchors include **`main+0x442bc0`** for client event-message handling, confirmed by `dm/host/diag.c:414` and the observation gate in `dm/tools/patch_nso.py:641`, and `main+0x52d6f8` for client room loading. The latter appears in the rift implementation's explanation of room-layout disagreement (`dm_rift.c:964–969`). It illustrates why movement, room generation and gameplay tables must match between authority and client; it does not establish a complete S2C handler set.
+源码推导的分析锚点包括客户端事件消息处理函数 **`main+0x442bc0`**，由 `dm/host/diag.c:414` 和 `dm/tools/patch_nso.py:641` 的观察开关确认；以及客户端房间加载点 `main+0x52d6f8`。后者出现在 rift 实现对房间布局不一致的解释中（`dm_rift.c:964–969`）。这说明移动、房间生成和游戏数据表必须在权威端与客户端之间保持一致；它并未确立完整的服务器到客户端（S2C）处理函数集合。
 
-Unknowns include the concrete offline send/receive methods, queue before socket/loopback delivery, complete per-recipient rules, packet-buffer ownership/lifetime, variable-length framing, compression, area initialization, full player synchronization, disconnect cleanup, and which paths rely on same-process pointers. No full bidirectional network protocol reconstruction is claimed.
+未知项包括：离线模式的具体发送/接收方法、套接字/回环交付前的队列、完整的逐接收者规则、数据包缓冲区的所有权/生命周期、变长分帧、压缩、区域初始化、完整玩家同步、断线清理，以及哪些路径依赖同进程指针。本报告不声称已重建完整的双向网络协议。
 
-Source permalinks: [generic send in dm_elysium.c](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/host/dm_elysium.c#L325), [vault notifications](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/host/dm_vault.c#L155), [client event observation gate](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/tools/patch_nso.py#L641).
+源码永久链接：[dm_elysium.c 中的通用发送](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/host/dm_elysium.c#L325)、[vault 通知](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/host/dm_vault.c#L155)、[客户端事件观察开关](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/tools/patch_nso.py#L641)。
 
-## Timing and stale heartbeat documentation
+## 时序与过时的心跳文档
 
-The repository models the server at **25 ticks per second**: `dm/host/hle_hid.c:161` defines `SERVER_TICKS_PER_SECOND 25ull`. The scheduler interpretation in `diag.c:1433–1445` identifies `main+0x5d5120`, a 40 ms deadline increment at `0x5d51fc`, and the main loop taking one time snapshot before possible catch-up ticks. This is consistent source evidence for a 40 ms simulation cadence. It does not establish a network send rate, snapshot rate, or permissible latency budget.
+仓库按**每秒 25 tick** 建模服务器：`dm/host/hle_hid.c:161` 定义了 `SERVER_TICKS_PER_SECOND 25ull`。`diag.c:1433–1445` 对调度器的解释标出 `main+0x5d5120`、`0x5d51fc` 处每次增加 40 ms 的截止时间，以及主循环在可能进行追赶 tick 之前获取一次时间快照。这些源码证据一致支持 40 ms 的游戏模拟节拍。它们不能确定网络发送频率、快照频率或可接受的延迟预算。
 
-There is a material documentation/code discrepancy at this baseline:
+此基线存在重要的文档与代码差异：
 
-| Documented behavior | Current executable source behavior |
+| 文档描述的行为 | 当前可执行源码的行为 |
 |---|---|
-| `dm/verify/command_packet_format.md:15–22,43–45` and `tick_state_format.md:73` say recorded heartbeat `0x6d` and progress `0x6f` are injected, and the local system messages are discarded during replay. | `diag.c:1251` implements `sys_clock_msg(id)` for these two IDs. `:1254` exempts them from dropping, and `:1385` excludes their recorded copies from injection. The current replay retains the local timing messages. |
+| `dm/verify/command_packet_format.md:15–22,43–45` 和 `tick_state_format.md:73` 表示：回放会注入录制的心跳 `0x6d` 和进度 `0x6f`，并丢弃本地产生的系统消息。 | `diag.c:1251` 以 `sys_clock_msg(id)` 识别这两个 ID。`:1254` 使它们免于被丢弃，`:1385` 排除其录制副本的注入。当前回放会保留本地产生的时序消息。 |
 
-The comments immediately above the code (`diag.c:1243–1250`) explain that the messages affect acknowledgements/downstream interpolation fields and that injecting another timeline's heartbeat caused a replay disconnect. Those comments are repository analysis claims; the explicit filtering predicates are directly verified source facts. The current source predicates control any reproduction of the baseline behavior.
+紧邻代码上方的注释（`diag.c:1243–1250`）解释，这些消息会影响确认/下游插值字段，注入另一条时间线的心跳曾导致回放断线。这些注释属于仓库中的分析声明；明确的过滤条件则是直接验证过的源码事实。复现基线行为时，应以当前源码条件为准。
 
-Consequences for design:
+对设计的影响：
 
-- Keep simulation time, per-client progress, transport liveness and frame presentation separate.
-- Establish each remote peer's own timing/acknowledgement state. Reusing one local system client number for all four peers is not a supported design.
-- Preserve the ordinary join/loading lifecycle when researching the bridge. Existing replay code deliberately allows lifecycle messages outside the replay window.
-- Do not define the network contract from the stale replay table. Reconcile both English and Chinese packet documents if implementation work updates that contract.
+- 分别处理游戏模拟时间、逐客户端进度、传输存活检测和画面呈现。
+- 为每个远程连接建立各自的时序/确认状态。四个连接共用一个本地系统客户端编号没有设计依据。
+- 调研桥接层时保留常规的加入/加载生命周期。现有回放代码有意允许回放窗口之外的生命周期消息通过。
+- 不要根据过时的回放表定义网络契约。如果实现工作更新了该契约，需要同步核对英文和中文数据包文档。
 
-This report records the discrepancy without changing the upstream verification documents.
+本报告记录该差异，不修改上游验证文档。
 
-Source permalinks: [current timing-message predicates](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/host/diag.c#L1241), [older packet documentation](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/verify/command_packet_format.md#L15), [scheduler explanation](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/host/diag.c#L1433).
+源码永久链接：[当前时序消息判断条件](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/host/diag.c#L1241)、[旧数据包文档](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/verify/command_packet_format.md#L15)、[调度器解释](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/host/diag.c#L1433)。
 
-## Shipped Guest inspection and the REA boundary
+## 已发布 Guest 检查与 REA 的边界
 
-The signed v1.0.18 Guest artifact has SHA-256:
+签名 v1.0.18 Guest 文件的 SHA-256 为：
 
 `9b470fb516c9c19ece5d70019c003e9140d402c1221a138e981ba871111f2a31`
 
-Genuine REA inspection established an arm64 Mach-O and its split sections/segments. Evidence identifiers:
+真正的 REA 检查确认了它是 arm64 Mach-O，以及其拆分的节/段。证据标识符：
 
-- `ev_af7678bcb338c57d3c065f28bcda9d02815ed476f6b4cbf438b38635977dce2c`: Mach-O inspection.
-- `ev_e1a439593263a5d3115fccfa40b819ddfc32f801bf6ee9be77c863d5c8c2ae5a`: segments projection.
+- `ev_af7678bcb338c57d3c065f28bcda9d02815ed476f6b4cbf438b38635977dce2c`：Mach-O 检查。
+- `ev_e1a439593263a5d3115fccfa40b819ddfc32f801bf6ee9be77c863d5c8c2ae5a`：段视图。
 
-Private evidence is recorded in `.tmp/rea/original-guest-evidence.json`. Imports and exports were not reported exhaustively; a completed segments view is not proof that no additional logical dependencies exist.
+私有证据记录在 `.tmp/rea/original-guest-evidence.json`。导入和导出项未被穷举报告；完成段视图不等于证明不存在其他逻辑依赖。
 
-The packaging splits executable and writable image material. `dm/host/loader.c:277–325` explains and implements remapping the signed sections back into original image-relative positions. Consequently, direct Mach-O addresses and file offsets do not preserve all original `main+offset` relationships.
+封装将可执行内容与可写映像内容分开。`dm/host/loader.c:277–325` 解释并实现了将签名节映射回原始映像相对位置。因此，直接使用 Mach-O 地址和文件偏移，不能保留所有原始 `main+offset` 关系。
 
-The runtime research produced two **analysis-only** ELF derivatives:
+运行时调研生成了两个**仅供分析**的 ELF 派生文件：
 
-| Private artifact | Provenance and limit |
+| 私有文件 | 来源与限制 |
 |---|---|
-| `.tmp/rea/v1.0.18/main.original-layout.analysis.elf` | Reconstructs original-relative layout from the three signed Guest sections. No guest bytes changed. Manifest: `.tmp/rea/v1.0.18/manifest.json`; ELF SHA-256 `d90ee8a8a49774108e0b319680912e39b4d04426f6c0da3371339d07426a7990`. |
-| `.tmp/rea/v1.0.18/main.base0-relative.analysis.elf` | Applies only 60,560 `R_AARCH64_RELATIVE` relocations at synthetic base zero; 214,362 bytes changed. Manifest: `.tmp/rea/v1.0.18/base0-relative-manifest.json`; write ledger: `.tmp/rea/v1.0.18/base0-relative-writes.tsv`; ELF SHA-256 `1aa58c298d3c32dbcf8cca053021ebe26c618cd32fc852e3177192381a770ecc`. |
+| `.tmp/rea/v1.0.18/main.original-layout.analysis.elf` | 从签名 Guest 的三个节重建原始相对布局。guest 字节没有改变。清单：`.tmp/rea/v1.0.18/manifest.json`；ELF SHA-256 为 `d90ee8a8a49774108e0b319680912e39b4d04426f6c0da3371339d07426a7990`。 |
+| `.tmp/rea/v1.0.18/main.base0-relative.analysis.elf` | 仅在合成的零基址下应用 60,560 条 `R_AARCH64_RELATIVE` 重定位；共改变 214,362 字节。清单：`.tmp/rea/v1.0.18/base0-relative-manifest.json`；写入记录：`.tmp/rea/v1.0.18/base0-relative-writes.tsv`；ELF SHA-256 为 `1aa58c298d3c32dbcf8cca053021ebe26c618cd32fc852e3177192381a770ecc`。 |
 
-The helper `.tmp/rea/derive_main.py` reproduces the derivation. The manifests verify source-section readback and ELF load payloads. Twelve `SOURCE_ANCHOR_*` symbols were added as analyst annotations from source; they are not recovered guest symbols or proven function boundaries.
+辅助脚本 `.tmp/rea/derive_main.py` 可复现上述派生过程。清单验证了源节回读和 ELF 加载内容。另添加了十二个 `SOURCE_ANCHOR_*` 符号，作为从源码提取的分析标注；它们不是恢复出的 guest 符号，也不是已证明的函数边界。
 
-Neither derivative is a runnable server. Import relocation, module linkage, constructors, TLS, key pages, BSS runtime objects and ordinary initialization remain unresolved. The base-zero derivative supports static pointer/vtable analysis only.
+两个派生文件都不是可运行的服务器。导入重定位、模块链接、构造器、TLS、密钥页、BSS 运行时对象和常规初始化仍未解决。零基址派生文件仅支持静态指针/虚表分析。
 
-### Focused REA decompilation completed
+### 已完成聚焦 REA 反编译
 
-The initial Hopper provider timed out after 120 seconds. Its authenticated document shutdown could not be confirmed; REA reported a retained Hopper document/private runtime, and the shared application was not terminated. Separately, the first independent Ghidra pass was intentionally cancelled after approximately eight minutes of global analysis and closed cleanly; its diagnostics remain under `.tmp/rea/ghidra-attempt1/`. A changed-profile **genuine REA/Ghidra 12.1.4 session successfully decompiled the two focused functions and returned function dossiers**, then closed with no remaining resources owned by that Ghidra session. This successful cleanup does not establish closure of the earlier Hopper document.
+最初的 Hopper 后端在 120 秒后超时。无法确认通过认证接口关闭其文档；REA 报告保留了 Hopper 文档/私有运行目录，共享应用未被终止。另外，首次独立 Ghidra 分析在全局分析约八分钟后被主动取消，并干净关闭；诊断记录保留在 `.tmp/rea/ghidra-attempt1/`。随后，更换分析配置的**真正 REA/Ghidra 12.1.4 会话成功反编译了两个目标函数，并返回函数档案**；会话关闭后没有残留由该 Ghidra 会话拥有的资源。这次成功清理不能证明此前的 Hopper 文档已经关闭。
 
-The successful target was the separately manifested base-zero-relative ELF above. The exact analysis profile digest is `2eca5a8334fc8c54a5d443bdecc6aeabc269645610808660b871a8cab8f7ec18`; the profile and summary are `.tmp/rea/ghidra-focused-profile.json` and `.tmp/rea/ghidra-focused-findings.json`. REA 6.7.0 used Ghidra 12.1.4 and a locally built ARM64 decompiler from checksum-pinned publisher source. The original binary was not executed.
+成功分析的目标是上文具有独立清单的零基址相对 ELF。确切分析配置的摘要为 `2eca5a8334fc8c54a5d443bdecc6aeabc269645610808660b871a8cab8f7ec18`；配置和总结分别位于 `.tmp/rea/ghidra-focused-profile.json` 和 `.tmp/rea/ghidra-focused-findings.json`。REA 6.7.0 使用 Ghidra 12.1.4，以及由校验和固定的发布者源码在本地构建的 ARM64 反编译器。原始二进制未被执行。
 
-| Focused observation | Evidence identifier and private record |
+| 聚焦观察 | 证据标识符与私有记录 |
 |---|---|
-| Sender at `main+0x2ceab0` | Pseudocode `ev_bbe5dfab494abbf3d0048faf582d156f6d45d282c0d48903b58e4985159ba099`, `.tmp/rea/ghidra-client-send.evidence.json`; dossier `ev_fa0a9d45eafa97629e0693ab127b6bc0c721f1d8f28c64bb2af731828c4d1d7e`, `.tmp/rea/ghidra-client-send-dossier.evidence.json`. |
-| Receiver at `main+0x632510` | Pseudocode `ev_995499b033882d56e1eeed8f6faf1d90d663cf0a989603081e21f1b4be7deb81`, `.tmp/rea/ghidra-server-receiver.evidence.json`; dossier `ev_e192f45e1896ba5a61d7025c4b270f000550051551de12aafecf4fec0dd53f4c`, `.tmp/rea/ghidra-server-receiver-dossier.evidence.json`. |
+| `main+0x2ceab0` 处的发送函数 | 伪代码 `ev_bbe5dfab494abbf3d0048faf582d156f6d45d282c0d48903b58e4985159ba099`，`.tmp/rea/ghidra-client-send.evidence.json`；函数档案 `ev_fa0a9d45eafa97629e0693ab127b6bc0c721f1d8f28c64bb2af731828c4d1d7e`，`.tmp/rea/ghidra-client-send-dossier.evidence.json`。 |
+| `main+0x632510` 处的接收函数 | 伪代码 `ev_995499b033882d56e1eeed8f6faf1d90d663cf0a989603081e21f1b4be7deb81`，`.tmp/rea/ghidra-server-receiver.evidence.json`；函数档案 `ev_e192f45e1896ba5a61d7025c4b270f000550051551de12aafecf4fec0dd53f4c`，`.tmp/rea/ghidra-server-receiver-dossier.evidence.json`。 |
 
-The sender's analyzed body establishes an entry-local size condition `param_2 < 0x200`, an optional progress message `0x6f` before an ordinary command whose identifier is below `0x67`, and dispatch of a `{begin,end}` byte range through the **inline object** `main+0x2d9f438`, virtual method `+0x30`. The entry's size condition rejects the ordinary send path for lengths at or above 512. This is not a universal maximum for all messages or wire frames. The concrete virtual implementation, buffer copying and downstream framing remain unresolved.
+分析到的发送函数体确立了入口局部长度条件 `param_2 < 0x200`，会在编号小于 `0x67` 的普通指令之前有条件地发送进度消息 `0x6f`，并通过**内嵌对象** `main+0x2d9f438` 的虚方法 `+0x30` 分发 `{begin,end}` 字节范围。此入口的长度条件使大于等于 512 字节的内容无法进入普通发送路径。这不是所有消息或线上帧的通用最大值。具体虚方法实现、缓冲区复制方式和下游分帧仍未解决。
 
-The receiver's analyzed body reads a leading 32-bit client ID, uses the client hash rooted at `main+0x2d68610`, follows connection `+0x2e0` to the game, and resolves the game's client chain at `+0x138`. It calls the player lookup at `main+0x5d7e60` before dispatching to `main+0x6e5b40`. Crucially, it advances the incoming data pointer by four bytes but passes the original length argument unchanged. The length's inclusion/exclusion of the prefix and the surrounding queue/transport contract are **unknown**. These local lookups establish neither remote peer authentication nor safe multi-client admission.
+分析到的接收函数体读取开头的 32 位客户端 ID，使用以 `main+0x2d68610` 为根的客户端哈希表，沿连接的 `+0x2e0` 找到游戏，并解析游戏位于 `+0x138` 的客户端链。它先调用 `main+0x5d7e60` 查找玩家，再分发到 `main+0x6e5b40`。关键在于，它将传入数据指针前移四字节，却仍传递原始长度参数。长度是否包含前缀、外围队列/传输契约如何，均**未知**。这些本地查找既不能确立远程连接认证，也不能证明安全的多客户端入房。
 
-The dossiers' caller/callee coverage is explicitly partial: the sender inventory omits 20 incoming body-reference sources and two unresolved calls; the receiver has one unresolved call. Twelve source-anchor seeds are synthetic annotations, not recovered names. Decompiler Parameter ID, Call Convention ID, Decompiler Switch Analysis, Basic Constant Reference Analyzer and Call-Fixup Installer were disabled; global signatures, references and indirect calls are therefore not an exhaustive reconstruction. FunctionManager reports sender and receiver bodies at `0x2ceab0–0x2cecef` and `0x632510–0x632723`. Its terminal/no-return flags for calls to `0x1b76f60` exclude fallthrough in the flow model; the callee's inability to return was not independently proven.
+函数档案的调用者/被调用者覆盖明确不完整：发送函数清单省略了 20 个指向函数体的传入引用来源，并有两个未解析调用；接收函数有一个未解析调用。十二个源码锚点种子是合成标注，并非恢复出的名称。Decompiler Parameter ID、Call Convention ID、Decompiler Switch Analysis、Basic Constant Reference Analyzer 和 Call-Fixup Installer 均被禁用，因此全局签名、引用和间接调用并未被穷尽重建。FunctionManager 报告的发送和接收函数体范围分别为 `0x2ceab0–0x2cecef` 和 `0x632510–0x632723`。它对 `0x1b76f60` 调用的终止/不返回标记，使控制流模型排除了顺序继续执行；但该被调用函数确实不会返回，尚未经过独立证明。
 
-An independent shell disassembly corroborates the same focused windows, with command and output hashes in `.tmp/rea/llvm-focused/manifest.json`. That record is explicitly **shell disassembly, not REA**. No runtime/global initialization, imports, socket exchange, game execution, complete S2C codec, four-client session or headless Linux simulation has been established.
+独立的 shell 反汇编佐证了相同的聚焦窗口，命令和输出的哈希记录在 `.tmp/rea/llvm-focused/manifest.json`。该记录明确属于 **shell 反汇编，不是 REA**。运行时/全局初始化、导入、套接字交换、游戏执行、完整 S2C 编解码器、四客户端会话或无图形界面的 Linux 游戏模拟，均尚未确立。
 
-The final boundary is therefore **signed-artifact layout and two focused C2S functions analyzed; full bidirectional protocol and runtime feasibility incomplete**. No proprietary bytecode, raw decompiler text, original executables or game archives are included in this document or proposed for source control.
+因此，最终边界是：**已分析签名程序布局和两个聚焦 C2S 函数；完整双向协议及运行可行性尚未完成验证**。本文档不包含专有字节码、原始反编译文本、原始可执行文件或游戏资源包，也不提议将这些内容纳入源码版本控制。
 
-## Linux and four-player constraints
+## Linux 与四人联机约束
 
-The existing host is Apple-specific. `loader.c:42–49` verifies a Darwin pthread TSD layout using `tpidrro_el0`; `:287,321` uses Mach VM operations. `thread.c:35–47` constructs the guest's emulated TLS/thread-local-region state separately from host thread ownership. `dm/host/Makefile:12–72` pulls in Objective-C application code, Metal, input and cloud implementations. `hle_net.c:7–47` returns unavailable/failure for network/socket operations. Linux hosting needs a platform backend and a headless lifecycle, not only a container definition.
+现有宿主具有 Apple 平台依赖。`loader.c:42–49` 使用 `tpidrro_el0` 验证 Darwin pthread TSD 布局；`:287,321` 使用 Mach VM 操作。`thread.c:35–47` 将 guest 的模拟 TLS/线程本地区域状态与宿主线程归属分开构建。`dm/host/Makefile:12–72` 引入 Objective-C 应用代码、Metal、输入和云实现。`hle_net.c:7–47` 对网络/套接字操作返回不可用/失败。Linux 宿主需要平台后端和无图形界面生命周期，不能仅靠容器定义完成。
 
-The existing binary rewrite is also ABI-specific. `dm/tools/patch_nso.py:370–407` temporarily stores values below the current stack pointer, at offsets such as `-16` and `-24`, while borrowing registers and resolving emulated thread slots. These templates rely on the Apple red-zone convention. The generic Arm AAPCS64 instead forbids access to the inactive stack region below SP: [AAPCS64 universal stack constraints](https://github.com/ARM-software/abi-aa/blob/f44acc9198335c8a4fe0d8b0ade3ec3df328c0ad/aapcs64/aapcs64.rst#L1184), source commit 2026-10-15, retrieved 2026-10-20. A Linux port must regenerate/review templates and signal/stack behavior under its actual ABI; sharing the AArch64 ISA does not make Darwin TLS or below-SP scratch storage portable.
+现有二进制重写也依赖特定 ABI。`dm/tools/patch_nso.py:370–407` 在借用寄存器并解析模拟线程槽位时，会暂时将值存放在当前栈指针下方，例如 `-16` 和 `-24` 偏移处。这些模板依赖 Apple 的 red-zone 约定。通用 Arm AAPCS64 则禁止访问 SP 以下的非活动栈区域：[AAPCS64 通用栈约束](https://github.com/ARM-software/abi-aa/blob/f44acc9198335c8a4fe0d8b0ade3ec3df328c0ad/aapcs64/aapcs64.rst#L1184)，源码提交日期 2026-10-15，获取日期 2026-10-20。Linux 移植必须按其实际 ABI 重新生成/审查模板和信号/栈行为；共享 AArch64 指令集不意味着 Darwin TLS 或 SP 下方的临时存储可直接移植。
 
-No measured graphics-free/null-renderer equivalence result is available in this research. `dm/host/front_mac.m:188–189` provides a windowless front-end path, which still runs the same guest; it does not establish a graphics-free authoritative server. `dm/gfx/tools/nometal_run.py` is an offline shader-tool wrapper, not a runtime null renderer. Removing presentation must preserve necessary queries, synchronization, memory effects, frame/tick pacing and lifecycle progress. That needs measurement against representative authoritative gameplay and save results, not an assumption that every graphics call can return success.
+本次调研尚无不使用图形功能/空渲染器的等价性实测结果。`dm/host/front_mac.m:188–189` 提供不显示窗口的前端路径，但仍运行同一个 guest；这不能确立无需图形功能的权威服务器。`dm/gfx/tools/nometal_run.py` 是离线着色器工具包装器，并非运行时空渲染器。移除画面呈现时，必须保留必要的查询、同步、内存效应、帧/tick 节奏和生命周期推进。需要用代表性的权威游戏行为和存档结果进行测量，不能假设所有图形调用直接返回成功即可。
 
-The server CPU remains an open deployment choice. Protocol messages can cross between ARM64 phones and an x86_64 or arm64 server. A source-reimplemented simulation can be compiled for either server ISA. Reusing the original Switch ARM64 simulation introduces a separate execution choice: native arm64 Linux after the platform contract is implemented, or a validated translation/emulation strategy on x86_64 Linux. A Windows x64 host engine has its own separate runtime/compatibility tradeoffs. Compare the candidates with measured tick timing and operational cost; do not infer an ARM64 server requirement merely because the phones are ARM64.
+服务器 CPU 仍是待定的部署选择。协议消息可以在 ARM64 手机与 x86_64 或 arm64 服务器之间传递。用源码重新实现的游戏模拟可以面向任一服务器指令集编译。复用原 Switch ARM64 游戏模拟则会引入独立的执行选择：在平台契约实现后原生运行于 arm64 Linux，或在 x86_64 Linux 上采用经过验证的指令翻译/模拟方案。Windows x64 宿主引擎也有各自的运行时/兼容性取舍。应根据实测 tick 耗时和运维成本比较候选方案，不能仅因手机是 ARM64 就推断服务器必须使用 ARM64。
 
-Source permalinks: [Darwin TSD check](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/host/loader.c#L42), [rewrite scratch storage](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/tools/patch_nso.py#L370), [windowless front end](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/host/front_mac.m#L188).
+源码永久链接：[Darwin TSD 检查](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/host/loader.c#L42)、[重写中的临时存储](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/tools/patch_nso.py#L370)、[无窗口前端](https://github.com/jhaizhou-ops/d2r-mobile/blob/120fe55c02a5633476998a44f8c3c3c809fa48b0/dm/host/front_mac.m#L188)。
 
-The current mods also assume one local player/game in several places:
+当前模组还有多处假定只有一个本地玩家/游戏：
 
-- `diag.c:1152` holds one last game and one system client number; `:1708–1710` asserts one owner thread for diagnostic tick buffers.
-- `dm_rift.c:100–116` has process-level room/progression/menu state and one player-bearing run state.
-- `dm_vault.c:49–56` has one active in-memory/on-disk vault and one pending queue.
-- `dm_world.c:24–25` reads a single local-player global through the guest.
+- `diag.c:1152` 保存一个最近的游戏和一个系统客户端编号；`:1708–1710` 断言诊断 tick 缓冲区仅由一个线程拥有。
+- `dm_rift.c:100–116` 包含进程级房间/进度/菜单状态，以及一个带玩家的 run 状态。
+- `dm_vault.c:49–56` 只有一个当前内存/磁盘 vault，以及一个待处理队列。
+- `dm_world.c:24–25` 通过 guest 读取单一本地玩家全局变量。
 
-One worker process per room is a useful isolation candidate for room-level globals and crashes. It does not solve the four separate player owners inside that room. Authoritative features need explicit room-, peer-, player- and character-scoped ownership. Presentation-only hooks remain on the phone; gameplay mutation belongs to the room authority. Current global state must be audited rather than mechanically exposed to four network connections.
+每个房间使用一个工作进程，是隔离房间级全局变量和崩溃的有效候选方式。但它不能解决房间内四个玩家分别归属的问题。权威端功能需要明确区分房间、连接、玩家和角色的状态归属。仅与画面呈现有关的钩子留在手机端；游戏状态修改归房间权威端处理。必须审计现有全局状态，不能机械地将其暴露给四个网络连接。
 
-The phone-local-character requirement also changes persistence relative to a closed-realm server. Each join needs a fresh, immutable input snapshot for that session, including the applicable character sidecars. The worker's working copy is temporary session state. Updated save results must return to the owning phone through a revision-aware transaction; character names alone cannot identify the owner because different phones may use identical names. The main proposal requires an account-level lease covering shared-stash mutations, related sidecars and cloud application, plus durable session recovery and revision-checked result delivery. The complete build-specific file manifest and save-safe boundary remain experimental gates. A server recovery journal supports delivery without becoming a permanent server character roster.
+手机本地角色要求也使持久化设计有别于封闭战网服务器。每次加入都需要为该会话创建新的、不可变的输入快照，包含适用的角色辅助存档文件。工作进程的工作副本是临时会话状态。更新后的存档结果必须通过带版本校验的事务返回所属手机；仅凭角色名称无法识别所有者，因为不同手机可能使用相同名称。主提案要求账号级租约，覆盖共享仓库修改、相关辅助存档文件和云端应用，同时支持持久化会话恢复与经过版本校验的结果交付。具体游戏构建所需的完整文件清单，以及可安全保存的边界，仍是实验验证门槛。服务器恢复日志负责支持结果交付，并不形成服务器永久角色列表。
 
-## External primary precedents
+## 外部一手先例
 
-All pages below were retrieved on 2026-10-20. Author claims are not represented as tests executed by this project.
+下列页面均于 2026-10-20 获取。作者声明不代表本项目执行过相关测试。
 
-| Source | Date / license evidence | What it establishes and what it does not |
+| 来源 | 日期 / 许可证证据 | 能证明什么，以及不能证明什么 |
 |---|---|---|
-| [Blizzard beta FAQ](https://news.blizzard.com/en-us/article/23688836/play-diablo-ii-resurrectedtm-during-the-early-access-open-beta) | Published 2021-08-10 | Official TCP/IP support was removed before release. It does not prove absence of internal simulation or serialization paths. |
-| [D2RLoader TCP/IP guide](https://d2rloader.net/tcp-ip.html) | Current author documentation; retrieved 2026-10-20 | Author describes modern D2R co-op with local offline characters, direct/LAN/public/unlisted games and compatibility checks. Windows PC precedent; Switch/iPhone interoperability unproved. |
-| [D2RLoader changelog](https://d2rloader.net/changelog.html) | 1.3.1-beta: 2026-09-24; 1.2.0-beta: 2026-08-30 | Author reports D2R 3.3 support, room listings/heartbeats and connection fixes. This is not a verified Linux headless runtime. |
-| [D2RLoader SDK README](https://github.com/D2RLoader/PluginSDK/blob/03a5af9e0feb3f95f95e148e330e01f6635950df/README.md#advanced-low-level-d2rcore-access) | Commit 2026-10-14; SDK MIT | Dedicated-server `PrepareHostEnvironment` contract and host-controlled gameplay roles. Requirements explicitly Windows x64. MIT covers the SDK, not an assumed license for the loader core. |
-| [D2GS 1.13c](https://github.com/tesseract2048/d2gs/blob/b95492957fab1dae4b374eea4dffdcb6baf374d7/README.md) | Master commit 2015-01-03; README GPL-2.0-or-later | Separates D2GS networking and D2GE game logic, reusing original classic D2 binaries through LibD2Server. No D2R compatibility claim. |
-| [D2GS historical author explanation](https://github.com/pvpgn/d2gs109/blob/master/README.md) | Author text dated 2001-08-13 | Historical precedent for reusing TCP/IP host simulation. Classic protocol behavior is not evidence of current D2R packet compatibility. |
-| [Classic Docker/Wine deployment](https://github.com/espenmjos/d2gs) | Current README; wrapper MIT | LoD 1.14d clients, D2GS, Wine 9 and Ubuntu 24.04. Useful deployment precedent with separate component licenses; no claim of D2R or Switch support. |
-| [PvPGN](https://github.com/pvpgn/pvpgn-server) | GPL-2.0; current supported-client list | Classic account/realm service precedent through D2/LoD 1.14d. The README explicitly treats D2GS as separate. Recreating its whole realm is unnecessary for the requested owned clients. |
-| [OpenDiablo2 status](https://github.com/OpenDiablo2/OpenDiablo2/blob/7f92c571bf04057a7fbdfb5d25a486f7d775e3c3/docs/status.md) | Archived; last master commit 2021-10-21; GPL-3.0 | Its own March 2021 status describes Act 1 town/panels and substantial missing gameplay. It is not a complete compatible D2R server. |
-| [Tristramd status](https://github.com/rookmoot/tristramd/blob/636783c00b601780a22f1ebe8b705ff9cf9047a9/README.md) | Master commit 2017-10-30; MIT | Classic account/realm work reaches create/join but remains on loading, per its own README. Not a finished simulation. |
-| [diablo2-protocol](https://github.com/MephisTools/diablo2-protocol) | Last push 2020-07-30; MIT | Classic 1.13/1.14 packet codecs and client/server scaffolding. Not complete game rules or a proven D2R schema. |
+| [Blizzard 测试 FAQ](https://news.blizzard.com/en-us/article/23688836/play-diablo-ii-resurrectedtm-during-the-early-access-open-beta) | 发布于 2021-08-10 | 官方 TCP/IP 支持在正式发布前被移除。这不能证明内部游戏模拟或序列化路径不存在。 |
+| [D2RLoader TCP/IP 指南](https://d2rloader.net/tcp-ip.html) | 作者当前文档；获取于 2026-10-20 | 作者描述了现代 D2R 使用本地离线角色联机，支持直连/LAN/公开/不公开房间和兼容性检查。这是 Windows PC 先例；Switch/iPhone 互通尚未验证。 |
+| [D2RLoader 更新日志](https://d2rloader.net/changelog.html) | 1.3.1-beta：2026-09-24；1.2.0-beta：2026-08-30 | 作者报告了 D2R 3.3 支持、房间列表/心跳和连接修复。这不是已验证的 Linux 无图形界面运行时。 |
+| [D2RLoader SDK README](https://github.com/D2RLoader/PluginSDK/blob/03a5af9e0feb3f95f95e148e330e01f6635950df/README.md#advanced-low-level-d2rcore-access) | 提交于 2026-10-14；SDK 为 MIT | 提供专用服务器 `PrepareHostEnvironment` 契约和由宿主控制的游戏角色。要求明确为 Windows x64。MIT 覆盖 SDK，不能据此推定 loader 核心的许可证。 |
+| [D2GS 1.13c](https://github.com/tesseract2048/d2gs/blob/b95492957fab1dae4b374eea4dffdcb6baf374d7/README.md) | Master 提交于 2015-01-03；README 为 GPL-2.0-or-later | 分离 D2GS 网络与 D2GE 游戏逻辑，通过 LibD2Server 复用原经典 D2 二进制。未声称兼容 D2R。 |
+| [D2GS 历史作者说明](https://github.com/pvpgn/d2gs109/blob/master/README.md) | 作者文本日期为 2001-08-13 | 提供复用 TCP/IP 宿主游戏模拟的历史先例。经典协议行为不能证明与当前 D2R 数据包兼容。 |
+| [经典版 Docker/Wine 部署](https://github.com/espenmjos/d2gs) | 当前 README；包装层为 MIT | 使用 LoD 1.14d 客户端、D2GS、Wine 9 和 Ubuntu 24.04。是有用的部署先例，各组件许可证独立；未声称支持 D2R 或 Switch。 |
+| [PvPGN](https://github.com/pvpgn/pvpgn-server) | GPL-2.0；当前支持客户端列表 | 经典账号/realm 服务先例，支持至 D2/LoD 1.14d。README 明确将 D2GS 视为独立组件。用户允许修改客户端，因此无须重建它的完整 realm。 |
+| [OpenDiablo2 状态](https://github.com/OpenDiablo2/OpenDiablo2/blob/7f92c571bf04057a7fbdfb5d25a486f7d775e3c3/docs/status.md) | 已归档；最后一次 master 提交于 2021-10-21；GPL-3.0 | 其自身 2021 年 3 月状态描述了第一幕城镇/界面面板，以及大量缺失的游戏功能。它不是完整兼容的 D2R 服务器。 |
+| [Tristramd 状态](https://github.com/rookmoot/tristramd/blob/636783c00b601780a22f1ebe8b705ff9cf9047a9/README.md) | Master 提交于 2017-10-30；MIT | 据其 README，经典账号/realm 工作可到达创建/加入阶段，但会停留在加载界面。它不是完成的游戏模拟。 |
+| [diablo2-protocol](https://github.com/MephisTools/diablo2-protocol) | 最后推送于 2020-07-30；MIT | 提供经典 1.13/1.14 数据包编解码和客户端/服务器框架。它不包含完整游戏规则，也不是已证明适用于 D2R 的协议结构。 |
 
-No external source above establishes that classic D2 packet lengths, opcodes or save semantics can be copied unchanged into the Switch build. D2RLoader is the strongest current co-op precedent, but its public SDK is an API contract rather than the loader's transport implementation.
+上述外部来源均不能证明经典 D2 的数据包长度、操作码或存档语义可以原样用于 Switch 构建。D2RLoader 是当前最有力的联机先例，但其公开 SDK 是 API 契约，并非 loader 的传输实现。
 
-## Candidate comparison and recommendation
+## 候选方案比较与建议
 
-| Candidate | Benefit | Required proof |
+| 候选方案 | 优点 | 需要证明的内容 |
 |---|---|---|
-| Reimplement protocol and complete simulation in Linux-native source | Clean runtime portability and explicit ownership | Current D2R schema plus complete maps, combat, AI, skills, items, quests, RNG and save behavior. Classic projects provide references, not a ready engine. |
-| Reuse the ARM64 guest simulation headlessly on Linux | Retains detailed original rules and this mod's behavior | Linux platform contract, headless game creation, four-player lifecycle, deterministic cleanup, session save import/export. |
-| Own transport around guest client/server boundaries | Fits modified clients and invitation-only rooms without official-service emulation | Complete C2S/S2C routing, per-peer state, framing, backpressure, client local-authority suppression and recovery. Combine with the guest worker for final authority. |
-| Phone-hosted simulation plus Linux relay/control plane | Modern D2RLoader supplies a related host-game precedent | iOS background/termination behavior and host connectivity. It supplies only relay authority on Linux and does not meet a strict Linux-authoritative requirement. |
-| Windows x64 guest/loader hosted under Wine in Linux | External dedicated-host contracts and classic Wine precedent | Actual current headless hosting and ARM64-client compatibility, runtime dependencies and loader licensing. Remains a contingency, not an established deployable option. |
+| 用 Linux 原生源码重新实现协议和完整游戏模拟 | 运行时便于移植，状态归属明确 | 当前 D2R 协议结构，以及完整的地图、战斗、AI、技能、物品、任务、RNG 和存档行为。经典项目可作参考，并非现成引擎。 |
+| 在 Linux 上无图形界面复用 ARM64 guest 游戏模拟 | 保留原游戏的详细规则和本模组行为 | Linux 平台契约、无图形界面创建游戏、四人生命周期、确定性清理、会话存档导入/导出。 |
+| 围绕 guest 客户端/服务器边界自建传输层 | 适合修改后的客户端和仅邀请房间，无须模拟官方服务 | 完整 C2S/S2C 路由、逐连接状态、分帧、背压、抑制客户端本地权威逻辑，以及恢复机制。与 guest 工作进程结合，由后者承担最终权威游戏逻辑。 |
+| 手机承载游戏模拟，Linux 提供中继/控制面 | 现代 D2RLoader 提供了相关的主机建房先例 | iOS 后台/终止行为与主机连通性。Linux 在该方案中仅负责中继，不满足严格的 Linux 权威游戏逻辑要求。 |
+| 在 Linux 中通过 Wine 运行 Windows x64 guest/loader | 存在外部专用宿主契约和经典 Wine 先例 | 实际可用的当前版本无图形界面宿主、ARM64 客户端兼容性、运行时依赖和 loader 许可证。它仍是备选方向，尚未成为已确立的可部署选项。 |
 
-Prefer the guest-worker/custom-transport combination if its proof gates pass. Treat a native simulation rewrite as a separate, substantially larger project. The worker must be demonstrated before estimating ordinary implementation tasks around the room service.
+若验证门槛通过，优先采用 guest 工作进程与自定义传输层的组合。原生游戏模拟重写应视为独立且规模显著更大的项目。在估算房间服务周边的常规实现任务前，必须先演示工作进程可用。
 
-## Focused next REA questions
+## 后续聚焦 REA 问题
 
-Use the original-layout ELF for byte-faithful code inspection and the separately manifested base-zero derivative for static pointer references. Preserve their distinction in every result. The following are bounded analysis questions on owned artifacts; they are not directions to probe official services.
+对字节保持原样的代码检查使用原始布局 ELF；对静态指针引用分析使用带独立清单的零基址派生文件。每项结果都要保留两者的区别。以下是在自有程序副本上进行的限定分析问题，不是探测官方服务的指引。
 
-| Priority | Original `main` anchors | Question / expected evidence |
+| 优先级 | 原始 `main` 锚点 | 问题 / 预期证据 |
 |---|---|---|
-| 1 | Sender `0x2ceab0`, inline object `0x2d9f438`, virtual `+0x30`; receive pump `0x5d3960`; receiver `0x632510`; dispatcher `0x6e5b40` | Extend the completed focused decompilation to the concrete offline transport and both queues. Resolve copying/lifetime and why the receiver advances by four while preserving the length. Distinguish remote framing from local client-ID envelopes. |
-| 1 | System dispatch `0x6310b0`; heartbeat handler anchor `0x6317f4`; source-described join `0x67` and character chunk `0x6c` | Establish room admission, per-peer context, chunk completion and disconnect cleanup. Distinguish observed handlers from source annotations. Do not infer network authentication from local join acceptance. |
-| 1 | Generic send object `0x2d7f3d8`, virtual method `+0x28`; notification `0x642f70`; client event `0x442bc0`; room load `0x52d6f8` | Resolve the concrete offline vtable method and its downstream queue; distinguish object address from pointer slot. Prove recipient selection, byte-range copying and lifetime before selecting the bridge seam. |
-| 2 | Game create `0x5d0bd0`; tick `0x5d3bc0`; scheduler `0x5d5120`; main loop `0x2c1340` | Determine minimal headless lifecycle, required initialized objects, shutdown and tick deadlines. Identify presentation dependencies and effects of all clients leaving. |
-| 2 | Gameplay table `0x20a4190`; system table `0x1daf73c` | Enumerate reachable handlers with lengths/validation sources where available. Mark variable-size cases and unknowns. A table count is not coverage of a usable protocol. |
-| 2 | Per-player save load/validate source anchors `0x6f0c70`, `0x6fe640`; item serialization `0x581b60` | Establish complete phone-local save ingress and result egress, per-peer ownership, failure states and sidecar coordination. These are source-derived anchors until independently verified. |
+| 1 | 发送函数 `0x2ceab0`、内嵌对象 `0x2d9f438`、虚方法 `+0x30`；接收循环 `0x5d3960`；接收函数 `0x632510`；分发器 `0x6e5b40` | 在已完成的聚焦反编译基础上，延伸至离线模式的具体传输实现和两侧队列。解决复制/生命周期问题，以及接收函数为何将指针前移四字节却保留原长度。区分远程分帧与本地客户端 ID 封装。 |
+| 1 | 系统分发 `0x6310b0`；心跳处理锚点 `0x6317f4`；源码描述的加入消息 `0x67` 和角色分块 `0x6c` | 确立入房、逐连接上下文、分块完成和断线清理。区分实际观察到的处理函数与源码标注。不能从本地加入被接受就推断已有网络认证。 |
+| 1 | 通用发送对象 `0x2d7f3d8`、虚方法 `+0x28`；通知 `0x642f70`；客户端事件 `0x442bc0`；房间加载 `0x52d6f8` | 解析离线模式的具体虚表方法及其下游队列；区分对象地址与指针槽位。在选择桥接边界之前，证明接收者选择、字节范围复制和生命周期。 |
+| 2 | 游戏创建 `0x5d0bd0`；tick `0x5d3bc0`；调度器 `0x5d5120`；主循环 `0x2c1340` | 确定最小无图形界面生命周期、必需的已初始化对象、关闭流程和 tick 截止时间。识别画面呈现依赖，以及所有客户端离开后的影响。 |
+| 2 | 游戏指令表 `0x20a4190`；系统消息表 `0x1daf73c` | 枚举可达处理函数，并在可获得时记录长度/校验依据。标明变长情况和未知项。表项数量不等于可用协议的覆盖度。 |
+| 2 | 逐玩家存档加载/校验源码锚点 `0x6f0c70`、`0x6fe640`；物品序列化 `0x581b60` | 确立完整的手机本地存档输入和结果输出、逐连接所有权、失败状态及辅助存档文件协同。在独立验证之前，这些仍是源码推导锚点。 |
 
-Follow static analysis with a controlled two-process owned-client experiment only after lifecycle and buffer contracts are understood, then extend the acceptance criteria to four peers. A successful single-player replay or one remote action is insufficient evidence of a cooperative session.
+理解生命周期和缓冲区契约后，再进行受控的双进程自有客户端实验，随后将验收条件扩展到四个连接。成功的单人回放或一次远程操作，不足以证明完整联机会话成立。
 
-## Evidence and decision checklist
+## 证据与决策检查表
 
-- [x] Source baseline and shipped Guest identity recorded.
-- [x] Internal C2S capture/injection, separate system-message paths and a generic per-client S2C send call found in source.
-- [x] Diagnostic envelope/payload distinction and capture truncation limit recorded.
-- [x] 25 Hz source timing model separated from rendering and network timing.
-- [x] Stale heartbeat replay documentation compared with current executable predicates.
-- [x] Signed Guest split sections and original-relative analysis derivatives have provenance.
-- [x] Genuine focused REA/Ghidra sender/receiver decompilation and dossiers completed with evidence IDs; successful session closed cleanly.
-- [x] Entry-local sender size guard and receiver prefix/unchanged-length observation recorded without asserting a complete wire contract.
-- [x] Linux TLS/red-zone/platform dependencies and representative mod singletons identified; null-renderer equivalence explicitly unmeasured.
-- [x] Four-player rooms and fresh phone-local character import on every join recorded as hard requirements; server CPU remains undecided.
-- [x] Current D2RLoader co-op/dedicated-host contracts distinguished from classic precedents.
-- [ ] Full C2S and S2C ownership, serialization, framing and recipient contracts independently recovered.
-- [ ] Four separately owned peers admitted into one authoritative game.
-- [ ] Remote clients proven to have no independent authoritative world.
-- [ ] Headless/null-renderer equivalence measured and Linux worker demonstrated.
-- [ ] x86_64 Linux and arm64 Linux execution strategies compared; deployment CPU chosen with evidence.
-- [ ] Fresh phone-local character import on every join and transactional result return demonstrated.
-- [ ] Sidecar ownership, same-name characters, reconnect and interrupted-return semantics resolved.
-- [ ] Representative gameplay/mod behavior verified under four-player concurrency.
+- [x] 已记录源码基线与已发布 Guest 身份。
+- [x] 已在源码中找到内部 C2S 录制/注入、独立系统消息路径，以及逐客户端的通用 S2C 发送调用。
+- [x] 已记录诊断封装/载荷区别及录制截断上限。
+- [x] 已将源码中的 25 Hz 时序模型与渲染、网络时序分开。
+- [x] 已比较过时的心跳回放文档与当前可执行判断条件。
+- [x] 签名 Guest 拆分节及原始相对布局分析派生文件均有来源记录。
+- [x] 已完成真正的聚焦 REA/Ghidra 发送/接收函数反编译与函数档案，附证据 ID；成功会话已干净关闭。
+- [x] 已记录发送入口局部长度限制，以及接收前缀/长度不变的观察，未据此声称已确立完整线上契约。
+- [x] 已识别 Linux TLS/red-zone/平台依赖和代表性模组单例；明确说明空渲染器等价性尚未测量。
+- [x] 已将四人房间和每次加入时重新导入手机本地角色记录为硬性要求；服务器 CPU 仍待定。
+- [x] 已将当前 D2RLoader 联机/专用宿主契约与经典先例区分开。
+- [ ] 独立恢复完整的 C2S 和 S2C 所有权、序列化、分帧与接收者契约。
+- [ ] 四个分别拥有独立上下文的连接进入同一个权威游戏。
+- [ ] 证明远程客户端不存在独立运行的权威世界。
+- [ ] 测量无图形界面/空渲染器等价性，并演示 Linux 工作进程。
+- [ ] 比较 x86_64 Linux 与 arm64 Linux 执行策略，并依据证据选择部署 CPU。
+- [ ] 演示每次加入时重新导入手机本地角色，以及事务性的结果返回。
+- [ ] 解决辅助存档文件所有权、同名角色、重连和结果返回中断的语义。
+- [ ] 在四人并发下验证代表性的游戏/模组行为。
 
-The unchecked items are feasibility gates and open questions, not completed protocol work.
+未勾选项是可行性验证门槛和待解问题，不是已完成的协议工作。
