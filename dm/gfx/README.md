@@ -27,6 +27,8 @@ For the build steps of the whole project see `README.md` and `setup.sh` in the r
 
 For which Metal object each NVN object and command lands on, see [nvn_metal_mapping.md](nvn_metal_mapping.md).
 
+An opt-in `DM_NVN_SIMULATOR=1` source configuration uses native `MTLArgumentEncoder` setters, actual encoded length/alignment and a host-only token-to-buffer registry. It separates classic resource tracking from unavailable residency-set APIs, retains indirect-resource declarations and fence-based release, and excludes BF/TBDR paths. Argument arenas and C1 backings stay within 64 KiB. Buffer setters require the full NVN bound extent, compiler-reflected minimum type size/alignment and backing containment; unproved or undersized ranges are rejected before a setter is called. This configuration is not selected by the current builder: Guest pool ownership, ordered uniform repacking, complete formats and the matching derived shader profile remain qualification work. Device defaults and game preflight remain unchanged. CPU policy/token tests run with `make -C dm/gfx/tests simulator-bindings` from the repository root and write under `.tmp`.
+
 ### Shader translation chain
 
 The game's shaders are GPU machine code for the Tegra X1 (the Maxwell instruction set). The translation from this machine code to Metal Shading Language is not done on the phone; all of it happens offline:

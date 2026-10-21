@@ -6,6 +6,8 @@ CFLAGS=-O1 -g -Wall -Wno-unused-function -I../nvn/include
 GFX=$(filter-out ../nvn/hle_nvn.c,$(sort $(wildcard ../nvn/*.c ../nvn/*.m ../nvn/*.S ../tex/*.c ../tex/*.m)))
 GFX_H=$(wildcard ../nvn/*.h ../nvn/*.inc ../nvn/include/*.h ../tex/*.h)
 FW=-framework Metal -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework UniformTypeIdentifiers
+SIMULATOR_BINDING_TEST=../../../.tmp/gfx-tests/t_simulator_bindings
+NATIVE_ARGUMENT_TEST=../../../.tmp/gfx-tests/t_native_arguments
 # 宿主 crash.c 一并链入：写保护单测走生产同一套缺页钩子
 # Host crash.c is linked in as well: the write-protect unit tests go through the same page-fault hook as production
 t_nvn: t_nvn.c ../nvn/hle_nvn.c ../../host/crash.c $(GFX) $(GFX_H)
@@ -56,9 +58,21 @@ t_pso_skey: t_pso_skey.m ../nvn/nvn_pso_skey.h ../nvn/nvn_obj.h
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_skey.m -framework Foundation
 t_pfv: t_pfv.m ../../host/crash.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pfv.m ../../host/crash.c $(filter-out ../nvn/nvn_mtl.m ../nvn/nvn_entry.S ../nvn/nvn_thunks.S,$(GFX)) $(FW)
+$(SIMULATOR_BINDING_TEST): t_simulator_bindings.c ../nvn/nvn_buffer_map.h ../nvn/nvn_simulator.h
+	mkdir -p $(@D)
+	clang -std=c11 -O1 -g -Wall -Wextra -Werror -o $@ $<
+$(NATIVE_ARGUMENT_TEST): t_native_arguments.m ../nvn/nvn_native_arguments.h ../nvn/nvn_buffer_map.h ../nvn/nvn_simulator.h
+	mkdir -p $(@D)
+	clang -O1 -g -Wall -Wextra -Werror -fobjc-arc -o $@ $< -framework Foundation
+simulator-bindings: $(SIMULATOR_BINDING_TEST) $(NATIVE_ARGUMENT_TEST)
+	$(SIMULATOR_BINDING_TEST)
+	$(NATIVE_ARGUMENT_TEST)
+.PHONY: simulator-bindings
 # 依赖一行一个、按字母序（免得加一个测试就整行冲突）；下面各条命令的先后不变
 # Dependencies one per line in alphabetical order (so that adding one test does not conflict on the whole line); the order of the commands below is unchanged
 run: \
+	$(SIMULATOR_BINDING_TEST) \
+	$(NATIVE_ARGUMENT_TEST) \
 	t_copy_pitch \
 	t_builtin \
 	t_cover \
@@ -85,6 +99,8 @@ run: \
 	t_xv \
 	t_zskip
 	./t_copy_pitch
+	$(SIMULATOR_BINDING_TEST)
+	$(NATIVE_ARGUMENT_TEST)
 	./t_nvn
 	./t_dirty_slots
 	./t_dirty_race

@@ -11,6 +11,8 @@ Two conventions that run through the whole table:
 - **GPU address = CPU address**. NVN memory pools use memory the game allocates itself, and the graphics layer creates zero-copy Metal buffers on that same memory. Any buffer address the game passes in is looked up in the memory pools' interval table and turned into "which `MTLBuffer` + offset" (`mtl_addr()`).
 - **Record first, replay later**. Command buffer calls only write records into the command memory provided by the game (for the format see `nvn/nvn_obj.h`); only at submit time does `nvn/nvn_mtl.m` replay them as Metal commands.
 
+The opt-in Simulator source configuration resolves host-only buffer tokens to objects and offsets and uses native argument-encoder setters. It does not write tokens as GPU pointers. Buffer setters require the full NVN bound extent, compiler-reflected minimum type size/alignment and backing containment; unproved or undersized ranges are rejected before a setter is called. It is not selected by the builder until its Guest memory, constant-buffer, shader-profile and format qualification is complete; the default device mapping below remains unchanged.
+
 ## 1. Objects
 
 | NVN object | Metal implementation | Key points |
