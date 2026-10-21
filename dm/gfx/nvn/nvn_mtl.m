@@ -21,6 +21,7 @@
 #include "nvn_native_arguments.h"
 #include "nvn_ordered_constants.h"
 #include "nvn_depth_dummy.h"
+#include "nvn_prepared_arguments.h"
 // 编译期开关 DM_NVN_M3=1：图形后端走老接口（普通命令队列 / 命令缓冲 / 渲染与计算与拷贝编码器，逐槽绑定缓冲，对参数块引用的资源逐个声明），
 // 目标 macOS 15 / iOS 18。缺省 0 = Metal 4（macOS 26 / iOS 26）。两支共用同一份回放逻辑，分叉处都在 #if DM_NVN_M3 里
 // Compile-time switch DM_NVN_M3=1: the graphics backend uses the older API (ordinary command queue / command buffers / render, compute and copy encoders, buffers bound per slot, each resource referenced by an argument block declared individually),
@@ -161,6 +162,7 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_sim_sub_active;
 static _Atomic uint64_t g_sim_planned_fence;
 static NvnConstantPool *g_sim_constants;
+static NvnArgumentSubmission *g_sim_argument_submission;
 #endif
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_done;                         // 已完成的最大栅栏值（完成回调写） | Highest completed fence value (written by the completion callback)
@@ -774,6 +776,8 @@ void mtl_sub_begin(void) {
     if (!g_sim_constants) g_sim_constants = [[NvnConstantPool alloc] initWithDevice:g_dev budget:128u << 20];
     pthread_mutex_lock(&g_mu); uint64_t constant_done = g_done; pthread_mutex_unlock(&g_mu);
     if (!g_sim_constants || [g_sim_constants beginCompleted:constant_done]) MDIE("Simulator constant batch begin failed");
+    g_sim_argument_submission = [[NvnArgumentSubmission alloc] initWithCommand:g_cb byteBudget:64u << 20 bundleBudget:8192];
+    if (!g_sim_argument_submission) MDIE("Simulator argument submission allocation failed");
 #endif
 }
 
@@ -1019,6 +1023,11 @@ uint64_t mtl_sub_commit(void) {
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     up_flush();
     uint64_t fence = ++g_fence;
+#if DM_NVN_SIMULATOR
+    NvnArgumentRetirement *argument_retirement;
+    if ([g_sim_argument_submission finishForCommand:g_cb retirement:&argument_retirement]) MDIE("Simulator argument submission completion ownership failed");
+    g_sim_argument_submission = nil;
+#endif
     if (g_vis_ring_i >= 0) g_vis_ring[g_vis_ring_i].fence = fence;
     // 完成后的 CPU 可见效果：拷贝一份操作表进回调
     // CPU-visible effects after completion: copy the op table into the callback
@@ -1045,6 +1054,7 @@ uint64_t mtl_sub_commit(void) {
         }
         free(ops);
 #if DM_NVN_SIMULATOR
+        if ([argument_retirement retireCompletedCommand:cb]) MDIE("Simulator completed argument ownership retirement failed");
         defer_drain_to(fence);
 #endif
         pthread_mutex_lock(&g_mu); if (fence > g_done) g_done = fence; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
@@ -2786,11 +2796,22 @@ static inline __attribute__((always_inline)) void *samp_fast(int sid) {
 @interface NvArena : NSObject { @public id<MTLBuffer> buf; uint64_t gpu, fence; size_t used; } @end
 @implementation NvArena @end
 static NSMutableArray<NvArena *> *g_arenas; static NvArena *g_cur_arena; static NSMutableArray<NvArena *> *g_sub_arenas;
+#if DM_NVN_SIMULATOR
+static size_t g_sim_arena_bytes;
+#endif
 static NvArena *arena_new(void) {
     // for-in 循环变量不持有对象：先取强引用再从数组删，否则数组释放后返回的是野指针
     // The for-in loop variable does not retain the object: take a strong reference first and then remove it from the array, otherwise what is returned after the array releases it is a dangling pointer
     for (NvArena *it in g_arenas) if (it->fence && it->fence <= g_done) { NvArena *r = it; [g_arenas removeObject:r]; r->fence = 0; r->used = 0; return r; }
-    NvArena *a = [NvArena new]; a->buf = [g_dev newBufferWithLength:DM_NVN_SIMULATOR ? NVN_SIM_CONSTANT_LIMIT : 4 << 20 options:MTLResourceStorageModeShared]; a->gpu = buffer_address(a->buf); res_add(a->buf); return a;
+#if DM_NVN_SIMULATOR
+    if (g_sim_arena_bytes > (64u << 20) - NVN_SIM_CONSTANT_LIMIT) MDIE("Simulator argument/driver arena backing budget exceeded");
+#endif
+    NvArena *a = [NvArena new]; a->buf = [g_dev newBufferWithLength:DM_NVN_SIMULATOR ? NVN_SIM_CONSTANT_LIMIT : 4 << 20 options:MTLResourceStorageModeShared];
+#if DM_NVN_SIMULATOR
+    if (!a->buf || a->buf.length != NVN_SIM_CONSTANT_LIMIT) MDIE("Simulator argument arena allocation failed");
+    g_sim_arena_bytes += a->buf.length;
+#endif
+    a->gpu = buffer_address(a->buf); res_add(a->buf); return a;
 }
 void arena_begin(void) { if (!g_arenas) { g_arenas = [NSMutableArray array]; g_sub_arenas = [NSMutableArray array]; } g_cur_arena = nil; }
 void arena_commit(uint64_t fence) { for (NvArena *a in g_sub_arenas) { a->fence = fence; [g_arenas addObject:a]; } [g_sub_arenas removeAllObjects]; g_cur_arena = nil; }
@@ -3378,18 +3399,35 @@ static void sim_prepare_constants(NvShader *sh, int stage, double matrixOffset) 
     }
 }
 #endif
-static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
+static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex
+#if DM_NVN_SIMULATOR
+                       , NvnPreparedArguments * __strong *output
+#endif
+                       ) {
+#if DM_NVN_SIMULATOR
+    (void)metal_vertex;
+    if (g_enc || en || !output || !g_sim_argument_submission) MDIE("Simulator arguments must be prepared before creating their consumer");
+    if (!sh->ae) { *output = nil; return 1; }
+#else
     if (!sh->ae) return 1;
+#endif
 #if !DM_NVN_SIMULATOR
     uint64_t slots[NVN_REFL_MAXB] = {0};
 #endif
     args_sync_dirty();
-    if (!DM_NVN_SIMULATOR && !passdump() && !g_args_dirty[nvn_stage] && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5) {
+#if !DM_NVN_SIMULATOR
+    if (!passdump() && !g_args_dirty[nvn_stage] && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5) {
         bind_args(en, nvn_stage, metal_vertex, sh->ab_buf, sh->ab_gpu, sh->ab_off, sh->rf.abi);
         g_stat_args_reuse++;
         return 1;
     }
-#if DM_NVN_M3
+#endif
+#if DM_NVN_SIMULATOR
+    #define USE(r, u) do { id<MTLResource> resource_ = (id<MTLResource>)(r); \
+        if ([arguments addResource:resource_ usage:(u)]) MDIE("Simulator prepared resource admission failed: shader=%s reg=%d", sh->key, reg); \
+        if (__builtin_expect(g_res_check_on, 0)) res_check(resource_, sh->key, reg); } while (0)
+    #define USE_SAMP(r, u) do { (void)(u); if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)
+#elif DM_NVN_M3
     // 老接口：着色器经参数块间接访问的每个资源都要在本编码器上声明用途，系统才知道它和别的编码器（上传拷贝、别的通道）之间的先后依赖；
     // 不声明的话只读贴图会和写它的拷贝乱序（迁 Metal 4 前实测过）。同一编码器内重复声明是幂等的
     // Older API: every resource a shader accesses indirectly through an argument block must have its usage declared on this encoder, so that the system knows its ordering dependency against other encoders (upload copies, other passes);
@@ -3407,17 +3445,28 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     int bl = passdump() && (bl_all || bl_pass[nvn_stage] != g_stat_pass);
     if (bl) { bl_pass[nvn_stage] = g_stat_pass; PD("K %llu st%d key=%s nb=%d", g_stat_pass, nvn_stage, sh->key[0] ? sh->key : sh->builtin ? sh->builtin : "?", sh->rf.nb); }
 #if DM_NVN_SIMULATOR
+    if ([g_sim_argument_submission canPrepareLength:sh->arg_len]) MDIE("Simulator argument submission budget exceeded or layout invalid");
+    id<MTLArgumentEncoder> native_encoder = [sh->fn newArgumentEncoderWithBufferIndex:sh->rf.abi];
+    if (!native_encoder || native_encoder.encodedLength != sh->arg_len || native_encoder.alignment != sh->ae.alignment)
+        MDIE("Simulator per-use argument encoder layout differs from reflected layout");
     id<MTLBuffer> native_arguments;
     size_t native_offset = arena_alloc_aligned(sh->arg_len, MAX((NSUInteger)256, sh->ae.alignment), &native_arguments);
+    NvnPreparedArguments *arguments;
+    if ([g_sim_argument_submission prepareBuffer:native_arguments offset:native_offset length:sh->arg_len alignment:sh->ae.alignment index:sh->rf.abi stage:nvn_stage arguments:&arguments])
+        MDIE("Simulator argument block admission failed");
     memset((uint8_t *)native_arguments.contents + native_offset, 0, sh->arg_len);
-    [sh->ae setArgumentBuffer:native_arguments offset:native_offset];
+    [native_encoder setArgumentBuffer:native_arguments offset:native_offset];
     #define ARG_BUFFER(value, constant, requested) do { uint64_t token_ = (value), requested_ = (requested); \
         os_unfair_lock_lock(&g_m3_lk); \
-        int failed_ = nvn_native_encode_buffer(sh->ae, &g_sim_buffers, token_, requested_, sh->native_required[aid], sh->native_alignment[aid], (constant), aid); \
+        int failed_ = nvn_native_encode_buffer(native_encoder, &g_sim_buffers, token_, requested_, sh->native_required[aid], sh->native_alignment[aid], (constant), aid); \
         os_unfair_lock_unlock(&g_m3_lk); \
         if (failed_) MDIE("Simulator shader=%s reg=%d binding span invalid: requested=%llu required=%lu alignment=%lu", sh->key, reg, (unsigned long long)requested_, (unsigned long)sh->native_required[aid], (unsigned long)sh->native_alignment[aid]); } while (0)
-    #define ARG_TEXTURE(object, value) [sh->ae setTexture:(object) atIndex:aid]
-    #define ARG_SAMPLER(object, value) [sh->ae setSamplerState:(object) atIndex:aid]
+    #define ARG_TEXTURE(object, value) do { id<MTLTexture> texture_ = (object); \
+        if (!texture_ || texture_.device != g_dev) MDIE("Simulator prepared texture admission failed"); \
+        [native_encoder setTexture:texture_ atIndex:aid]; } while (0)
+    #define ARG_SAMPLER(object, value) do { id<MTLSamplerState> sampler_ = (object); \
+        if ([arguments addSampler:sampler_]) MDIE("Simulator prepared sampler admission failed"); \
+        [native_encoder setSamplerState:sampler_ atIndex:aid]; } while (0)
 #else
     #define ARG_BUFFER(value, constant, requested) do { slots[aid] = (value); } while (0)
     #define ARG_TEXTURE(object, value) do { slots[aid] = (value); } while (0)
@@ -3430,7 +3479,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
 #if DM_NVN_SIMULATOR
         if (sim_constant_kind(b->kind)) {
             id<MTLBuffer> prepared = g_sim_prepared[nvn_stage][aid];
-            if (nvn_native_encode_constant(sh->ae, prepared, sh->native_required[aid], sh->native_alignment[aid], aid))
+            if (nvn_native_encode_constant(native_encoder, prepared, sh->native_required[aid], sh->native_alignment[aid], aid))
                 MDIE("Simulator prepared constant layout invalid: shader=%s reg=%d", sh->key, reg);
             USE(prepared, MTLResourceUsageRead); continue;
         }
@@ -3539,17 +3588,26 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     #undef ARG_TEXTURE
     #undef ARG_SAMPLER
 #if DM_NVN_SIMULATOR
-    id<MTLBuffer> ab = native_arguments; size_t off = native_offset;
+    if ([arguments seal]) MDIE("Simulator argument block sealing failed");
+    [native_encoder setArgumentBuffer:nil offset:0];
+    *output = arguments;
 #else
     NSUInteger arg_len = sh->arg_len ? sh->arg_len : sh->ae.encodedLength;
     id<MTLBuffer> ab; size_t off = arena_alloc(arg_len, &ab);
     memcpy((uint8_t *)ab.contents + off, slots, arg_len);
-#endif
     bind_args(en, nvn_stage, metal_vertex, ab, buffer_address(ab) + off, off, sh->rf.abi);
-    sh->ab_buf = ab; sh->ab_gpu = buffer_address(ab) + off; sh->ab_off = off; sh->ab_pass = g_pass.serial; g_args_dirty[nvn_stage] = 0;
-    g_stat_args_enc++;
+    sh->ab_buf = ab; sh->ab_gpu = buffer_address(ab) + off; sh->ab_off = off; sh->ab_pass = g_pass.serial;
+#endif
+    g_args_dirty[nvn_stage] = 0; g_stat_args_enc++;
     return 1;
 }
+#if DM_NVN_SIMULATOR
+static NvnPreparedArguments *sim_prepare_arguments(NvShader *shader, int stage) {
+    NvnPreparedArguments *arguments = nil;
+    if (shader) encode_args(nil, shader, stage, 0, &arguments);
+    return arguments;
+}
+#endif
 static id<MTLBuffer> g_quad_ib; static uint64_t g_quad_gpu;
 static RENC rp_begin(void);
 // ---------- 通道前瞻：本通道是否用到深度 / 模板 ----------
@@ -5116,7 +5174,10 @@ frz_plain:;
             if (uy > 0) { sim_so = lround(uy*sim_th); if (ui_mat_ok()) sim_moff = 2*uy; else sim_vo = sim_so; }
         } }
     g_ui_moff = sim_moff;
-    sim_prepare_constants(pr->sh[0], 0, sim_moff); sim_prepare_constants(pr->sh[1], 1, 0);
+    sim_prepare_constants(pr->sh[0], 0, sim_moff);
+    NvnPreparedArguments *sim_vertex_arguments = sim_prepare_arguments(pr->sh[0], 0);
+    sim_prepare_constants(pr->sh[1], 1, 0);
+    NvnPreparedArguments *sim_fragment_arguments = sim_prepare_arguments(pr->sh[1], 1);
 #endif
     int need = g_enc || !tb_sub(TB_DS) ? 3 : pass_ds_need(), mode = defer_q_draw ? 0 : need == 0 ? 2 : need == 2 ? 3 : need == 1 ? 4 : 0;   // 2 都不挂 3 只挂模板 4 只挂深度 | 2 attach neither, 3 attach stencil only, 4 attach depth only
     int skip_d = mode != 0;
@@ -5190,8 +5251,13 @@ frz_plain:;
     static id<MTLBuffer> zero; if (!zero) { zero = [g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared]; res_add(zero); }
     static uint64_t zero_gpu; if (!zero_gpu) zero_gpu = buffer_address(zero);
     enc_r_vbuf(en, 30, zero_gpu);
+#if DM_NVN_SIMULATOR
+    if (sim_vertex_arguments && [sim_vertex_arguments bindRender:en]) MDIE("Simulator vertex argument binding failed");
+    if (sim_fragment_arguments && [sim_fragment_arguments bindRender:en]) MDIE("Simulator fragment argument binding failed");
+#else
     if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
     if (pr->sh[1]) encode_args(en, pr->sh[1], 1, 0);
+#endif
     // 参数绑定在登记表锁内捕获实际资源；资格判断到绑定期间有版本变化，则在任何GPU draw前切开重试。
     // Parameter binding captures the actual resources under the registry lock; if the version changed between the eligibility check and the binding, split and retry before any GPU draw.
     if (g_rt_range_active && (g_pass.reg_gen != g_reg_gen || g_pass.ser_gen != g_ser_gen || g_pass.range_dirty != nvn_dirty_now())) { rp_end(); draw(dw, di); return; }
@@ -5478,11 +5544,16 @@ static void dispatch(const p_dispatch *dp) {
     rp_end();
 #if DM_NVN_SIMULATOR
     sim_prepare_constants(cs, 5, 0);
+    NvnPreparedArguments *sim_arguments = sim_prepare_arguments(cs, 5);
 #endif
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     id<MTLComputeCommandEncoder> ce = pg_compute();
     enc_c_pso(ce, ps);
+#if DM_NVN_SIMULATOR
+    if (sim_arguments && [sim_arguments bindCompute:ce]) MDIE("Simulator compute argument binding failed");
+#else
     encode_args(ce, cs, 5, 0);
+#endif
     enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
     pg_compute_end(ce); enc_c_end(ce);
     bright_lut(cs);   // 3D 画面加亮：游戏算完调色表之后重写 | 3D picture brightening: rewrite after the game finishes computing the color lookup table

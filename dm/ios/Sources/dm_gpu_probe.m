@@ -14,6 +14,7 @@
 #include "../../gfx/nvn/nvn_buffer_identity.h"
 #include "../../gfx/nvn/nvn_ordered_constants.h"
 #include "../../gfx/nvn/nvn_depth_dummy.h"
+#include "../../gfx/nvn/nvn_prepared_arguments.h"
 #include "../../gfx/nvn/nvn_native_arguments.h"
 #include "dm_gpu_probe_checkpoint.h"
 
@@ -211,6 +212,95 @@ static NSDictionary *compute_at(id<MTLDevice> device, id<MTLCommandQueue> queue,
 static NSDictionary *compute(id<MTLDevice> device, id<MTLCommandQueue> queue, BOOL arguments,
                              id<MTLBuffer> supplied, const uint32_t *observed, DmGpuMemory *owner) {
     return compute_at(device, queue, arguments, supplied, observed, owner, 0, nil, nil);
+}
+
+static NSDictionary *prepared_arguments(id<MTLDevice> device, id<MTLCommandQueue> queue, BOOL (^publish)(NSDictionary *)) {
+    NSMutableDictionary *result = [@{@"status": @"pending", @"stage": @"compile_owned_arguments"} mutableCopy];
+    NSDictionary *(^failed)(NSString *, NSString *, NSError *) = ^NSDictionary *(NSString *status, NSString *stage, NSError *error) {
+        [result addEntriesFromDictionary:failure(status, stage, error)]; return result;
+    };
+    if (!publish(result)) return failed(@"error", @"result_persistence", nil);
+    NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct A { device uint *out [[id(0)]]; texture2d<float> image [[id(1)]]; sampler s [[id(2)]]; };"
+        "kernel void owned(constant A &a [[buffer(0)]],uint i [[thread_position_in_grid]]) {"
+        "uint4 p=uint4(round(a.image.sample(a.s,float2(.5f),level(0.0f))*255.0f));"
+        "uint color=p.x|(p.y<<8)|(p.z<<16)|(p.w<<24); a.out[i]=(i+1)^color; }";
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    if (!library) return failed(@"error", @"owned_library", error);
+    id<MTLFunction> function = [library newFunctionWithName:@"owned"];
+    if (!function) return failed(@"error", @"owned_function", nil);
+    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+    if (!pipeline) return failed(@"error", @"owned_pipeline", error);
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    NvnArgumentSubmission *submission = [[NvnArgumentSubmission alloc] initWithCommand:command byteBudget:4096 bundleBudget:2];
+    id<MTLBuffer> output = [device newBufferWithLength:768 options:MTLResourceStorageModeShared];
+    if (!submission || !output) return failed(@"error", @"owned_submission", nil);
+    memset(output.contents, 0xCD, output.length);
+    NSMutableArray<NvnPreparedArguments *> *bundles = [NSMutableArray array];
+    uint32_t colors[] = {UINT32_C(0x78563412), UINT32_C(0x12345678)};
+    NSUInteger encodedLength = 0, alignment = 0;
+    for (unsigned i = 0; i < 2; i++) {
+        @autoreleasepool {
+            result[@"stage"] = @"owned_resource_preparation"; result[@"bundle_pending"] = @(i);
+            if (!publish(result)) return failed(@"error", @"result_persistence", nil);
+            id<MTLArgumentEncoder> encoder = [function newArgumentEncoderWithBufferIndex:0];
+            if (!encoder || !nvn_sim_argument_layout(encoder.encodedLength, encoder.alignment)) return failed(@"unsupported", @"owned_argument_layout", nil);
+            if (i && (encodedLength != encoder.encodedLength || alignment != encoder.alignment)) return failed(@"error", @"owned_layout_changed", nil);
+            encodedLength = encoder.encodedLength; alignment = encoder.alignment;
+            id<MTLBuffer> bytes = [device newBufferWithLength:encodedLength options:MTLResourceStorageModeShared];
+            NvnPreparedArguments *prepared;
+            if ([submission prepareBuffer:bytes offset:0 length:encodedLength alignment:alignment index:0 stage:5 arguments:&prepared])
+                return failed(@"error", @"owned_block_admission", nil);
+            MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
+            descriptor.storageMode = MTLStorageModeShared; descriptor.usage = MTLTextureUsageShaderRead;
+            id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+            if (!texture) return failed(@"error", @"owned_texture", nil);
+            uint8_t pixel[] = {(uint8_t)colors[i],(uint8_t)(colors[i]>>8),(uint8_t)(colors[i]>>16),(uint8_t)(colors[i]>>24)};
+            [texture replaceRegion:MTLRegionMake2D(0,0,1,1) mipmapLevel:0 withBytes:pixel bytesPerRow:4];
+            MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
+            sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge; sd.supportArgumentBuffers = YES;
+            id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:sd];
+            if ([prepared addResource:output usage:MTLResourceUsageWrite] || [prepared addResource:texture usage:MTLResourceUsageRead] || [prepared addSampler:sampler])
+                return failed(@"error", @"owned_resource_admission", nil);
+            [encoder setArgumentBuffer:bytes offset:0]; [encoder setBuffer:output offset:i*256 atIndex:0];
+            [encoder setTexture:texture atIndex:1]; [encoder setSamplerState:sampler atIndex:2];
+            [encoder setArgumentBuffer:nil offset:0];
+            if ([prepared seal]) return failed(@"error", @"owned_seal", nil);
+            [bundles addObject:prepared];
+        }
+    }
+    result[@"bundles_before_consumer"] = @(submission.bundleCount); result[@"encoded_bytes"] = @(submission.byteCount);
+    for (NvnPreparedArguments *prepared in bundles) {
+        result[@"stage"] = @"owned_compute_consumer";
+        if (!publish(result)) return failed(@"error", @"result_persistence", nil);
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        if (!encoder) return failed(@"error", @"owned_compute_encoder", nil);
+        [encoder setComputePipelineState:pipeline];
+        if ([prepared bindCompute:encoder]) return failed(@"error", @"owned_compute_binding", nil);
+        [encoder dispatchThreadgroups:MTLSizeMake(64,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)]; [encoder endEncoding];
+    }
+    NvnArgumentRetirement *retirement;
+    if ([submission finishForCommand:command retirement:&retirement]) return failed(@"error", @"owned_completion_retention", nil);
+    bundles = nil; submission = nil;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block NvnArgumentsStatus retirementStatus = NvnArgumentsState;
+    [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        retirementStatus = [retirement retireCompletedCommand:completed]; dispatch_semaphore_signal(done);
+    }];
+    result[@"stage"] = @"owned_gpu_completion";
+    if (!publish(result)) return failed(@"error", @"result_persistence", nil);
+    [command commit];
+    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 5*NSEC_PER_SEC))) return failed(@"timeout", @"owned_gpu_completion", nil);
+    if (command.status != MTLCommandBufferStatusCompleted) return failed(@"error", @"owned_gpu_completion", command.error);
+    if (retirementStatus) return failed(@"error", @"owned_completion_retirement", nil);
+    const uint32_t *words = output.contents; BOOL match = YES, guards = YES;
+    for (unsigned j = 0; j < 2; j++) for (unsigned i = 0; i < 64; i++) if (words[j*64+i] != ((i+1)^colors[j])) match = NO;
+    for (unsigned i = 128; i < 192; i++) if (words[i] != UINT32_C(0xcdcdcdcd)) guards = NO;
+    [result removeObjectForKey:@"bundle_pending"];
+    result[@"argument_encoded_length"] = @(encodedLength); result[@"argument_alignment"] = @(alignment);
+    result[@"word_count"] = @128; result[@"output_match"] = @(match); result[@"surrounding_bytes_unchanged"] = @(guards);
+    result[@"status"] = match && guards ? @"passed" : @"error"; result[@"stage"] = @"owned_readback"; return result;
 }
 
 static NSDictionary *private_depth(id<MTLDevice> device, id<MTLCommandQueue> queue, BOOL (^publish)(NSDictionary *)) {
@@ -621,6 +711,12 @@ int dm_gpu_probe(void) {
                 else if (!shared || ![queue respondsToSelector:@selector(addResidencySet:)]) tests[@"residency_set"] = failure(@"unsupported", @"queue_residency", nil);
                 else { [set addAllocation:shared]; [set commit]; [queue addResidencySet:set]; [queue removeResidencySet:set]; tests[@"residency_set"] = @{@"status": @"passed", @"queue_registration": @YES}; }
             }
+        }
+        if (selection == DM_GPU_CASE_ARGUMENTS || selection == DM_GPU_CASE_ALL) {
+            if (!begin_test(result, path, @"prepared_arguments")) return 1;
+            tests[@"prepared_arguments"] = prepared_arguments(device, queue, ^BOOL(NSDictionary *detail) {
+                tests[@"prepared_arguments"] = detail; return write_report(result, path, NO);
+            });
         }
         if (selection == DM_GPU_CASE_DEPTH || selection == DM_GPU_CASE_ALL) {
             if (!begin_test(result, path, @"private_depth")) return 1;
