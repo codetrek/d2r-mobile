@@ -41,7 +41,7 @@ Xcode 只负责代码和自有 AppIcon；派生界面资源、运行表及源码
 
 当前 24 项合成测试覆盖模块与四份运行表关系、donor/模块字节变化、Mach-O 边界、设备与模拟器平台、着色器及 BF 集合、独立快照、复制期间和之后的变动、路径与大小限制、源链接目标替换，以及只读快照到可写暂存的元数据替换、复制损坏和最终资源缺失、多出或损坏。真实私人 donor 的模块和四份表通过关系检查，既有源码着色器缓存也通过当前分支的完整 BF 核对。
 
-新 v2 构建候选及运行检查尚待完成。私人 build03 在编译前因暂存权限停止，build04 在编译时发现源码快照遗漏 bcdec 头文件；暂存复制已改用当前构建拥有的文件，源码快照已统一覆盖整个 `dm/` 子树，并加入对应回归检查。实际着色器编译、画面、进局、正常保存退出和两个客户端共享同一权威世界，分别需要自己的运行回执；构建或线程检查通过不表示联机可用。
+私人 build05 已完成 v2 构建及全部来源核对，安装后的 14,363 个文件与清单一致；线程存储检查通过，基础 Metal 画面在 4 秒内观察到约 57–60 帧。私人 build03 在编译前因暂存权限停止，build04 在编译时发现源码快照遗漏 bcdec 头文件；暂存复制已改用当前构建拥有的文件，源码快照已统一覆盖整个 `dm/` 子树，并加入对应回归检查。实际游戏启动被模拟器 GPU 的 Metal3 family 与 BC 能力检查阻止，尚未进行整套着色器编译或进入 Guest 世界。进局、保存退出和共享世界仍需各自的运行回执；构建或线程检查通过不表示联机可用。
 
 ## 合成测试
 
@@ -50,3 +50,22 @@ python3 dm/ios/tests/test_simulator.py
 ```
 
 测试不需要原游戏或模拟器，临时数据留在仓库 `.tmp/simulator-tests`。源码快照测试只读取 Git 索引和当前文件，不创建提交。完整 iOS 测试入口也运行这些检查；原有需要私人夹具或生成技能资源的测试继续遵守各自的输入条件。
+
+## Host GPU 诊断
+
+显式启动应用并传 `-mode gpu`，应用只调用公开 Metal API，结果写入自己的 `Documents/gpu-<PID>-<UUID>.json`。这一路径不启动宿主游戏、不装载 Guest，也不放宽游戏前置检查。
+
+结果记录实际设备名、Objective-C 类、registryID、architecture、真实 Metal3/Apple2/BC/统一内存/参数缓冲层级，以及已加载的 Metal/AGX 映像路径。同时记录 `buffer.device`、`queue.device` 的公开设备信息和 `same_as_default`，保留它们返回模拟器包装设备或其他设备的真实结果。iOS 的公开 MTLDevice 接口没有直接的 parent-device accessor；设备名和这些访问器本身均不构成物理 GPU 能力证明。
+
+检查仅使用自有 16 KiB 缓冲和 64 个 uint32 元素：共享与零复制缓冲、GPU 地址 API 是否可用及是否非零、驻留集和队列登记、直接计算，以及参数编码器计算。两份计算核都要求 GPU 写回完整的确定结果，每次 GPU 完成等待上限为 5 秒。每项返回 passed、unsupported、error 或 timeout；状态不合并成游戏可用结论。每项开始前保存未完成报告与 pending_test，包含队列创建之前的检查点，因此中途系统断言或退出有明确阶段；CPU 状态测试覆盖已完成缓冲结果保留、队列故障前的待执行状态和写盘失败时不执行后续操作。外部启动器仍应设置整个进程的有限期限。
+
+CPU 结果检查可独立运行：
+
+```sh
+make -C dm/ios/tests ../../../.tmp/ios-tests/t_gpu_probe_result
+.tmp/ios-tests/t_gpu_probe_result
+make -C dm/ios/tests ../../../.tmp/ios-tests/t_gpu_probe_checkpoint
+.tmp/ios-tests/t_gpu_probe_checkpoint
+```
+
+Apple 的[模拟器 Metal 指南](https://developer.apple.com/documentation/metal/developing-metal-apps-that-run-in-simulator)说明模拟器提供近似 Apple family2 的功能，且不支持片元输入读取颜色附件。宿主硬件型号和模拟器机型都不能替代这些能力与计算检查。诊断代码尚需在自己的新候选中实际运行；既有 blank 画面不证明完整渲染器或 BF 路径可用。

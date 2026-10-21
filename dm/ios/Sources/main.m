@@ -799,6 +799,7 @@ static void run_mode(void) {
     else if (!strcmp(m, "file")) probe_file();
     else if (!strcmp(m, "tsd")) probe_tsd();
     else if (!strcmp(m, "msl")) probe_msl();
+    else if (!strcmp(m, "gpu")) { void dm_gpu_probe(void); dm_gpu_probe(); }
     else if (!strcmp(m, "blank")) { plog("blank：空白 Metal 60 帧清屏（发热负对照）"); return; }   // 一直跑到被停 | Runs until stopped
     else plog("未知模式 %s", m);
     plog("DONE");
