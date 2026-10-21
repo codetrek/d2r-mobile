@@ -84,6 +84,19 @@ make -C dm/ios/tests ../../../.tmp/ios-tests/t_gpu_probe_result ../../../.tmp/io
 
 它们覆盖确定输出、非法案例名、未完成报告顺序、三种分配方式、自有 VM 区域别名和完成回调生命周期。它们不能替代 GPU 运行回执。
 
-历史 diagnostic06 安装后身份匹配；实际返回 MTLSimDevice、Apple2、Tier1、Metal3/BC/统一内存为 false，共享缓冲有非零 GPU 地址。随后 malloc 后端的零复制包装触发 libxpc 断点，partial JSON 和 IPS 原样保留；尚未得到该产物的队列及计算结果。新增分配案例与别名策略目前仅通过 CPU/编译检查，需在新的固定产物中实际运行。
+历史 diagnostic06 安装后身份匹配；实际返回 MTLSimDevice、Apple2、Tier1、Metal3/BC/统一内存为 false，共享缓冲有非零 GPU 地址。随后 malloc 后端的零复制包装触发 libxpc 断点，partial JSON 和 IPS 原样保留；该产物没有队列及计算结果。此次失败不被后续产物的成功覆盖，也没有重复运行相同 malloc 案例。
+
+2026-10-21 的 diagnostic07 从已提交的案例选择代码生成 ARM64/platform7 产物，通过 v2 来源核对及安装后全部 14,363 个文件核对。五个案例各自启动新进程，外部时限为 30 秒；所有进程完成报告并退出，无未完成项、超时或崩溃。实际结果如下：
+
+| 检查 | 实际结果 |
+|---|---|
+| core 共享缓冲与队列 | 通过；公开 buffer/queue device 均为默认 MTLSimDevice |
+| core 直接计算、参数缓冲计算 | 均通过；每项 64 个预期值全部匹配，参数编码长度及对齐均为 8 |
+| 独立 vm_allocate 零复制 | 原地 GPU 变换通过；从原有内存读回全部 64 个预期值 |
+| MAP_SHARED 匿名 mmap 零复制 | 相同原地变换及完整回读通过 |
+| MTLBuffer 自有共享页别名 | copy=false 重映射与 CPU 别名可见性通过，GPU 变换后的原区域完整回读通过 |
+| 驻留集 | 创建返回 nil，报告 create_residency_set/error，未得到 NSError |
+
+五次启动的核心计算均通过。真实能力仍是 Apple2/Tier1，Metal3 family、BC 和统一内存均为 false；architecture API 可用但值为空，Metal 映像来自模拟器运行时。这些结果只证明本次自有小缓冲和计算路径，不证明任意 malloc/Guest 池包装、驻留集、全量游戏着色器或游戏渲染可用。实际游戏前置检查保持原样。
 
 Apple 的[模拟器 Metal 指南](https://developer.apple.com/documentation/metal/developing-metal-apps-that-run-in-simulator)说明模拟器提供近似 Apple family2 的功能，且不支持片元输入读取颜色附件。[零复制缓冲 API](https://developer.apple.com/documentation/metal/mtldevice/makebuffer(bytesnocopy:length:options:deallocator:))还要求页对齐和单一 VM 区域。宿主硬件型号与模拟器机型均不能替代这些契约和计算检查。
