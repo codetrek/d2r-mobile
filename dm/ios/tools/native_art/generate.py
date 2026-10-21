@@ -69,7 +69,9 @@ def write_source(rows, man, destination):
             f'const char dm_ta_binding_sha[]="{sha(binding.read_bytes())}";', 'static const struct { uint32_t id; int atlas,frame; } rows[]={']
     out += [' {%d,%d,%d},' % tuple(row) for row in rows]; out += ['};']
     out += [(HERE / 'implementation.c.inc').read_text()]
-    Path(destination).write_text('\n'.join(out) + '\n')
+    source = '\n'.join(out) + '\n'
+    Path(destination).write_text(source)
+    return source
 
 
 if __name__ == '__main__':

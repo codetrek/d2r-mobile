@@ -3,6 +3,7 @@
 
 import argparse
 import copy
+from contextlib import suppress
 import hashlib
 import importlib.util
 import json
@@ -17,8 +18,10 @@ import subprocess
 import sys
 import time
 
+sys.dont_write_bytecode = True
 from shaders import PROFILE, sha, stage
 from inputs import validate_donor
+import snapshot
 
 IOS = Path(__file__).resolve().parents[2]
 DM = IOS.parent
@@ -33,11 +36,11 @@ def module(name, path):
     return value
 
 
-def run(argv, root, env, name, capture=False):
+def run(argv, root, env, name, capture=False, *, cwd):
     print('[simulator] ' + name, flush=True)
     output = []
     with (root / 'logs' / (name + '.log')).open('wb', buffering=0) as log:
-        process = subprocess.Popen([str(x) for x in argv], env=env, cwd=IOS,
+        process = subprocess.Popen([str(x) for x in argv], env=env, cwd=cwd,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    bufsize=0, start_new_session=True)
         deadline = time.monotonic() + 900
@@ -60,7 +63,8 @@ def run(argv, root, env, name, capture=False):
                             sys.stdout.buffer.flush()
             result = process.wait(timeout=5)
         except BaseException:
-            os.killpg(process.pid, signal.SIGKILL)
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
             process.wait()
             raise
         finally:
@@ -72,18 +76,15 @@ def run(argv, root, env, name, capture=False):
     return b''.join(output).decode()
 
 
-def project(base, root, chain, bundle_id):
+def project(base, root, chain, bundle_id, ios):
     target = copy.deepcopy(base['targets']['DmIOS'])
     target.pop('preBuildScripts')
     target.pop('entitlements')
-    target['sources'] = [str(p) for p in sorted((IOS / 'Sources').rglob('*'))
+    target['sources'] = [str(p) for p in sorted((ios / 'Sources').rglob('*'))
                          if p.suffix in ('.c', '.m', '.h', '.S') and p.name != 'dm_touch_native_art.c']
-    target['sources'] += [str(IOS / 'Assets.xcassets'), dict(path='Gen/src'),
+    target['sources'] += [str(ios / 'Assets.xcassets'), dict(path='Gen/src'),
                          dict(path='Gen/main/main.c', compilerFlags='-Dmain=dm_main'),
                          dict(path='Gen/native/dm_touch_native_art.c')]
-    for item in sorted((root / 'resources').iterdir()):
-        target['sources'].append(dict(path=str(item), type='folder' if item.is_dir() else 'file',
-                                      buildPhase='resources'))
     target['dependencies'] = [d for d in target['dependencies'] if 'sdk' in d]
     target['info']['path'] = 'Gen/Info.plist'
     properties = target['info']['properties']
@@ -96,15 +97,15 @@ def project(base, root, chain, bundle_id):
                     SUPPORTED_PLATFORMS='iphonesimulator', SDKROOT='iphonesimulator', ARCHS='arm64',
                     ONLY_ACTIVE_ARCH='YES', TARGETED_DEVICE_FAMILY='1', DM_DEVICE_FAMILY='1',
                     OTHER_CFLAGS='$(inherited) -mcpu=apple-m1 -include "' + str(root / 'Gen/profile.h') +
-                    '" -iquote "' + str(IOS / 'Sources') + '"')
+                    '" -iquote "' + str(ios / 'Sources') + '"')
     return dict(name=TARGET, options=dict(deploymentTarget=dict(iOS='26.0')),
                 configFiles={c: 'Gen/dm.xcconfig' for c in ('Release', 'Debug')},
                 targets={TARGET: target}, schemes={TARGET: dict(build=dict(targets={TARGET: 'all'}))})
 
 
-def native_art(app, destination):
-    generator = module('simulator_native_art', IOS / 'tools/native_art/generate.py')
-    manifest = json.loads((IOS / 'Sources/TouchArt/native_art_manifest.json').read_text())
+def native_art(app, destination, ios):
+    generator = module('simulator_native_art', ios / 'tools/native_art/generate.py')
+    manifest = json.loads((ios / 'Sources/TouchArt/native_art_manifest.json').read_text())
     rows = []
     for line in (app / 'dm/derived.tsv').read_text().splitlines():
         fields = line.split('\t')
@@ -116,8 +117,11 @@ def native_art(app, destination):
         path = app / asset['asset']
         if sha(path) != asset['decoded_png_sha256']:
             raise ValueError('native-art PNG differs from the frozen original: ' + path.name)
-    generator.write_source(rows, manifest, destination)
-    return dict(rows=len(rows), descriptor_index_sha256=manifest['descriptor_index_sha256'])
+    generated = generator.write_source(rows, manifest, destination).encode()
+    return dict(rows=len(rows), descriptor_index_sha256=manifest['descriptor_index_sha256'],
+                generated_source_sha256=hashlib.sha256(generated).hexdigest(), generated_source_size=len(generated),
+                producer_sha256=sha(ios / 'tools/native_art/generate.py'),
+                input_sha256=sha(app / 'dm/derived.tsv'))
 
 
 def inspect_platform(path, expected_type):
@@ -153,17 +157,60 @@ def build(args):
     root = args.out.resolve()
     if not root.is_relative_to(REPO / '.tmp'):
         raise ValueError('--out must be within this repository .tmp directory')
+    original_inputs = {name: getattr(args, name).resolve() for name in
+                       ('modules', 'app_resources', 'tables', 'shader_cache', 'shader_manifest', 'shader_metadata')}
+    for path in original_inputs.values():
+        if root.is_relative_to(path) or path.is_relative_to(root):
+            raise ValueError('output overlaps a declared input')
     root.mkdir(parents=True, exist_ok=False)
     for path in ('logs', 'tmp', 'Gen', 'Gen/include', 'Gen/native', 'resources'):
         (root / path).mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, DEVELOPER_DIR=str(args.developer_dir), TMPDIR=str(root / 'tmp'),
                CLANG_MODULE_CACHE_PATH=str(root / 'clang-cache'), PYTHONUNBUFFERED='1',
                PYTHONPYCACHEPREFIX=str(root / 'pycache'), NSUnbufferedIO='YES')
-    app = args.app_resources.resolve()
+    tool_paths = [Path(sys.executable).resolve(), Path(shutil.which('xcodegen')).resolve(),
+                  Path('/usr/bin/codesign')]
+    for name in ('clang', 'ld', 'xcodebuild'):
+        tool_paths.append(Path(subprocess.check_output(['xcrun', '--sdk', 'iphonesimulator', '--find', name],
+                                                     env=env, text=True).strip()).resolve())
+    tool_inputs = {str(path): sha(path) for path in tool_paths}
+    source_root = root / 'inputs/source'
+    source_proof = snapshot.source(REPO, source_root)
+    dm, ios = source_root / 'dm', source_root / 'dm/ios'
+    groups = {}
+    selected = {}
+    for name, source in original_inputs.items():
+        destination = root / 'inputs' / name
+        if name == 'shader_manifest':
+            entries = [(source.name, source)]
+        elif name == 'modules':
+            entries = [(m + s, source / (m + s)) for m in ('main', 'sdk')
+                       for s in ('.patched.bin', '.fixups.tsv', '.gates.tsv')]
+        elif name == 'tables':
+            entries = [(n, source / n) for n in ('dm_hud_exp.h', 'dm_vault_tab.h', 'dm_bright_levels.inc')]
+        elif name == 'shader_metadata':
+            entries = [(n, source / n) for n in ('shader_map.tsv', 'pso_manifest.tsv', 'c1_full.tsv')]
+        elif name == 'app_resources':
+            excluded = {'DmIOS', 'Info.plist', 'PkgInfo', 'Frameworks', '_CodeSignature',
+                        'embedded.mobileprovision', 'Assets.car', 'msl', 'save_ref', 'save_ref_warlock',
+                        'Extensions', 'PlugIns'}
+            entries = [(n, p) for n, p in snapshot.tree_files(source)
+                       if Path(n).parts[0] not in excluded and not Path(n).name.startswith('AppIcon')]
+            entries.append(('Frameworks/Guest.framework/Guest', source / 'Frameworks/Guest.framework/Guest'))
+        else:
+            entries = snapshot.tree_files(source)
+            destination /= source.name
+        groups[name] = snapshot.capture(entries, destination)
+        selected[name] = destination / source.name if name == 'shader_manifest' else destination
+    args = copy.copy(args)
+    for name, path in selected.items():
+        setattr(args, name, path)
+    app = args.app_resources
     product = dict(line.split('=', 1) for line in (app / 'dm/shell_info.txt').read_text().splitlines() if '=' in line)
-    if product['PRODUCT'] != (DM / 'PRODUCT').read_text().strip():
+    if product['PRODUCT'] != (dm / 'PRODUCT').read_text().strip():
         raise ValueError('derived app resources and source PRODUCT differ')
     donor_proof = validate_donor(app, args.modules)
+    resource_bindings = {}
     source_inputs = {str(p): sha(p) for p in [args.shader_manifest, *(args.tables / n for n in
                     ('dm_hud_exp.h', 'dm_vault_tab.h', 'dm_bright_levels.inc')),
                     *(args.modules / (m + suffix) for m in ('main', 'sdk') for suffix in
@@ -174,6 +221,10 @@ def build(args):
                          'Extensions', 'PlugIns'} or path.name.startswith('AppIcon'):
             continue
         dst = root / 'resources' / path.name
+        files = [p for p in path.rglob('*') if p.is_file()] if path.is_dir() else [path]
+        for item in files:
+            name = str(item.relative_to(app))
+            resource_bindings[name] = groups['app_resources']['files'][name]
         if path.is_dir():
             shutil.copytree(path, dst)
             source_inputs.update({str(p): sha(p) for p in path.rglob('*') if p.is_file()})
@@ -184,57 +235,101 @@ def build(args):
     for module_name in ('main', 'sdk'):
         for suffix in ('.fixups.tsv', '.gates.tsv'):
             name = module_name + suffix
+            resource_bindings['dm/' + name] = groups['modules']['files'][name]
             shutil.copyfile(args.modules / name, root / 'resources/dm' / name)
     expected = {line.split('\t')[3] for line in (metadata / 'shader_map.tsv').read_text().splitlines()
                 if line and not line.startswith(('#', 'package\t'))}
-    fetch = module('simulator_dmsh_fetch', DM / 'gfx/tools/dmsh_fetch.py')
-    bf_want = {line.strip() for line in (DM / 'gfx/nvn/bf_want.tsv').read_text().splitlines()
+    fetch = module('simulator_dmsh_fetch', dm / 'gfx/tools/dmsh_fetch.py')
+    bf_want = {line.strip() for line in (dm / 'gfx/nvn/bf_want.tsv').read_text().splitlines()
                if line.strip() and not line.lstrip().startswith('#')}
     chain = json.loads(args.shader_manifest.read_text())['chain']
     shader_proof = stage(args.shader_cache, args.shader_manifest, root / 'resources/msl' / ('b-' + chain),
                          fetch.variant, bf_want, expected)
+    for name in shader_proof['identities']:
+        if name.endswith(('.json', '.metallib')) and name != '_b_build.json':
+            resource_bindings['msl/b-' + chain + '/' + name] = groups['shader_cache']['files'][name]
     for name in ('shader_map.tsv', 'pso_manifest.tsv', 'c1_full.tsv'):
+        resource_bindings['dm/' + name] = groups['shader_metadata']['files'][name]
         source_inputs[str(metadata / name)] = sha(metadata / name)
         shutil.copyfile(metadata / name, root / 'resources/dm' / name)
     if not (metadata / 'c1_full.tsv').read_text().startswith('# chain b-' + chain + ' '):
         raise ValueError('C1 metadata does not match the source shader chain')
-    art_proof = native_art(app, root / 'Gen/native/dm_touch_native_art.c')
-    config = run([sys.executable, IOS / 'tools/gen_build.py', DM / 'host', root / 'Gen'], root, env, 'host-inputs', True)
+    art_proof = native_art(app, root / 'Gen/native/dm_touch_native_art.c', ios)
+    generated_bindings = {'native/dm_touch_native_art.c': dict(
+        size=art_proof['generated_source_size'],
+        sha256=art_proof['generated_source_sha256'])}
+    config = run([sys.executable, ios / 'tools/gen_build.py', dm / 'host', root / 'Gen'], root, env, 'host-inputs', True, cwd=ios)
     config = config.replace('HEADER_SEARCH_PATHS = $(inherited) ',
                             'HEADER_SEARCH_PATHS = $(inherited) "' + str(root / 'Gen/include') + '" ', 1)
     config += 'OTHER_LDFLAGS = $(inherited) $(DM_FRAMEWORKS)\n'
-    (root / 'Gen/dm.xcconfig').write_text(config)
-    (root / 'Gen/profile.h').write_text('#define DM_SHELL 1\n#define DM_NVN_M3 1\n#define DM_SIMULATOR_SHADER_CHAIN "' + chain + '"\n')
+    profile = '#define DM_SHELL 1\n#define DM_NVN_M3 1\n#define DM_SIMULATOR_SHADER_CHAIN "' + chain + '"\n'
+    for name, content in (('dm.xcconfig', config), ('profile.h', profile)):
+        data = content.encode()
+        generated_bindings[name] = dict(size=len(data), sha256=hashlib.sha256(data).hexdigest())
+        (root / 'Gen' / name).write_bytes(data)
     for name in ('dm_hud_exp.h', 'dm_vault_tab.h', 'dm_bright_levels.inc'):
         for target in ('Gen/include', 'Gen/src'):
+            generated_bindings[target[4:] + '/' + name] = groups['tables']['files'][name]
             shutil.copyfile(args.tables / name, root / target / name)
     base_path = root / 'base-project.json'
-    run(['xcodegen', 'dump', '--no-env', '--type', 'json', '--spec', IOS / 'project.yml', '--file', base_path], root, env, 'project-input')
-    spec = project(json.loads(base_path.read_text()), root, chain, args.bundle_id)
+    run(['xcodegen', 'dump', '--no-env', '--type', 'json', '--spec', ios / 'project.yml', '--file', base_path], root, env, 'project-input', cwd=ios)
+    spec = project(json.loads(base_path.read_text()), root, chain, args.bundle_id, ios)
     spec_path = root / 'project.json'
     spec_path.write_text(json.dumps(spec, indent=2) + '\n')
-    guest = module('simulator_guest_dylib', DM / 'tools/guest_dylib.py')
+    guest = module('simulator_guest_dylib', dm / 'tools/guest_dylib.py')
     fw, _ = guest.write(args.modules, root / 'frameworks', ['main', 'sdk'],
                         bundle_id=args.bundle_id + '.guest', platform=guest.Platform.IOS_SIMULATOR)
     framework_proof = inspect_platform(Path(fw) / 'Guest', 6)
-    run(['xcodegen', 'generate', '--spec', spec_path, '--project', root], root, env, 'project-generate')
+    run(['xcodegen', 'generate', '--spec', spec_path, '--project', root], root, env, 'project-generate', cwd=ios)
+    resource_proof = dict(files=resource_bindings)
+    snapshot.verify(root / 'resources', resource_proof)
+    for name, identity in generated_bindings.items():
+        if sha(root / 'Gen' / name) != identity['sha256']:
+            raise ValueError('generated or copied source identity changed: ' + name)
+    staged_proof = {name: snapshot.fingerprint(root / name, source_root if name == 'Gen' else None)
+                    for name in ('Gen', 'resources', 'frameworks', TARGET + '.xcodeproj')}
+    project_inputs = {name: sha(root / name) for name in ('project.json', 'base-project.json')}
     run(['xcodebuild', '-project', root / (TARGET + '.xcodeproj'), '-scheme', TARGET,
          '-configuration', 'Release', '-sdk', 'iphonesimulator', '-destination', 'generic/platform=iOS Simulator',
-         '-derivedDataPath', root / 'dd', '-jobs', str(args.jobs), 'build'], root, env, 'app-build')
+         '-derivedDataPath', root / 'dd', '-jobs', str(args.jobs), 'build'], root, env, 'app-build', cwd=ios)
     result = root / 'dd/Build/Products/Release-iphonesimulator' / (TARGET + '.app')
+    platform_files = snapshot.fingerprint(result)
+    snapshot.package_resources(root / 'resources', result, resource_proof, platform_files['files'])
     frameworks = result / 'Frameworks'
     frameworks.mkdir(exist_ok=True)
     shutil.copytree(fw, frameworks / 'Guest.framework')
-    run(['codesign', '--force', '--sign', '-', frameworks / 'Guest.framework'], root, env, 'sign-framework')
-    run(['codesign', '--force', '--sign', '-', result], root, env, 'sign-app')
+    run(['codesign', '--force', '--sign', '-', frameworks / 'Guest.framework'], root, env, 'sign-framework', cwd=ios)
+    run(['codesign', '--force', '--sign', '-', result], root, env, 'sign-app', cwd=ios)
     app_proof = inspect_platform(result / TARGET, 2)
     signed_guest_proof = inspect_platform(frameworks / 'Guest.framework/Guest', 6)
+    final_donor_proof = validate_donor(result, args.modules)
+    if sha(frameworks / 'Guest.framework/Info.plist') != sha(Path(fw) / 'Info.plist'):
+        raise ValueError('final Guest framework metadata differs from the generated profile')
+    generated_files = set(platform_files['files']) | {
+        'Frameworks/Guest.framework/' + name for name in ('Guest', 'Info.plist', '_CodeSignature/CodeResources')}
+    snapshot.verify_package(result, resource_proof, generated_files)
+    final_app_inventory = snapshot.fingerprint(result)
     for path, digest in source_inputs.items():
         if sha(path) != digest:
             raise ValueError('build input changed: ' + path)
-    manifest = dict(schema='d2r.ios-simulator-build.v1', state='built_unexecuted', profile=PROFILE,
-                    source_revision=subprocess.check_output(['git', '-C', REPO, 'rev-parse', 'HEAD'], text=True).strip(),
-                    source_diff_sha256=hashlib.sha256(subprocess.check_output(['git', '-C', REPO, 'diff', '--binary'])).hexdigest(),
+    snapshot.verify(source_root, source_proof, originals=True)
+    for name, proof in groups.items():
+        base = selected[name].parent if name == 'shader_manifest' else selected[name]
+        snapshot.verify(base, proof, originals=True)
+    for name, proof in staged_proof.items():
+        snapshot.verify(root / name, proof)
+    for path, digest in tool_inputs.items():
+        if sha(path) != digest:
+            raise ValueError('build tool changed: ' + path)
+    for name, digest in project_inputs.items():
+        if sha(root / name) != digest:
+            raise ValueError('generated project input changed: ' + name)
+    manifest = dict(schema='d2r.ios-simulator-build.v2', state='built_unexecuted', profile=PROFILE,
+                    source_revision=source_proof['revision'], source_diff_sha256=source_proof['diff_sha256'],
+                    source_snapshot=source_proof, input_snapshots=groups, staged_inputs=staged_proof,
+                    tool_inputs=tool_inputs, project_inputs=project_inputs,
+                    resource_bindings=resource_proof, generated_source_bindings=generated_bindings,
+                    final_app_inventory=final_app_inventory, final_bundled_modules=final_donor_proof,
                     source_inputs=source_inputs, app=str(result), app_identity=app_proof,
                     generated_guest_identity=framework_proof, guest_identity=signed_guest_proof,
                     shaders=shader_proof, native_art=art_proof, donor=donor_proof,

@@ -10,6 +10,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 IOS = Path(__file__).resolve().parents[1]
 REPO = IOS.parent.parent
@@ -17,6 +18,7 @@ sys.path.insert(0, str(IOS / 'tools/simulator'))
 import shaders
 import build as simulator_build
 import inputs as simulator_inputs
+import snapshot
 
 
 def load(name, path):
@@ -137,6 +139,130 @@ class Contracts(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     simulator_inputs.validate_donor(app, self.root)
 
+    def test_owned_snapshot_and_original_mutation(self):
+        source = self.root / 'input'
+        source.write_bytes(b'original')
+        destination = self.root / 'snapshot'
+        proof = snapshot.capture([('data', source)], destination)
+        snapshot.verify(destination, proof, originals=True)
+        source.write_bytes(b'changed')
+        self.assertEqual((destination / 'data').read_bytes(), b'original')
+        snapshot.verify(destination, proof)
+        with self.assertRaisesRegex(ValueError, 'original input changed'):
+            snapshot.verify(destination, proof, originals=True)
+
+    def test_snapshot_output_changes_and_extra_file(self):
+        source = self.root / 'input'
+        source.write_bytes(b'original')
+        destination = self.root / 'snapshot'
+        proof = snapshot.capture([('data', source)], destination)
+        (destination / 'data').chmod(0o644)
+        (destination / 'data').write_bytes(b'modified')
+        with self.assertRaisesRegex(ValueError, 'identity changed'):
+            snapshot.verify(destination, proof)
+        (destination / 'data').write_bytes(b'original')
+        (destination / 'extra').write_bytes(b'extra')
+        with self.assertRaisesRegex(ValueError, 'file set changed'):
+            snapshot.verify(destination, proof)
+
+    def test_snapshot_path_and_size_bounds(self):
+        source = self.root / 'input'
+        source.write_bytes(b'data')
+        for index, name in enumerate(('../outside', '/absolute', './alias')):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                snapshot.capture([(name, source)], self.root / str(index))
+        with mock.patch.object(snapshot, 'MAX_FILE_BYTES', 2), self.assertRaisesRegex(ValueError, 'resource bounds'):
+            snapshot.capture([('large', source)], self.root / 'bounded')
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            snapshot.capture([('same', source), ('same', source)], self.root / 'duplicate')
+
+    def test_snapshot_rejects_change_during_copy(self):
+        source = self.root / 'input'
+        source.write_bytes(b'data')
+        original_copy = snapshot.shutil.copyfile
+        def changing_copy(src, dst):
+            original_copy(src, dst)
+            Path(src).write_bytes(b'changed')
+        with mock.patch.object(snapshot.shutil, 'copyfile', changing_copy):
+            with self.assertRaisesRegex(ValueError, 'changed during snapshot'):
+                snapshot.capture([('data', source)], self.root / 'snapshot')
+
+    def test_staged_link_is_bound_to_exact_snapshot_file(self):
+        source = self.root / 'source'
+        source.mkdir()
+        (source / 'one').write_bytes(b'identical')
+        (source / 'two').write_bytes(b'identical')
+        destination = self.root / 'stage'
+        destination.mkdir()
+        link = destination / 'unit.c'
+        link.symlink_to(source / 'one')
+        with self.assertRaisesRegex(ValueError, 'unbound symlink'):
+            snapshot.fingerprint(destination)
+        proof = snapshot.fingerprint(destination, source)
+        snapshot.verify(destination, proof)
+        link.unlink()
+        link.symlink_to(source / 'two')
+        with self.assertRaisesRegex(ValueError, 'symlink target changed'):
+            snapshot.verify(destination, proof)
+        with self.assertRaisesRegex(ValueError, 'invalid'):
+            snapshot.capture([('link', link)], self.root / 'copy')
+
+    def test_source_snapshot_includes_actual_tool_inputs(self):
+        proof = snapshot.source(REPO, self.root / 'source')
+        self.assertTrue(proof['includes_untracked_inputs'])
+        for name in ('dm/host/loader.c', 'dm/tools/guest_dylib.py', 'dm/ios/tools/simulator/build.py',
+                     'dm/ios/tools/simulator/snapshot.py'):
+            self.assertEqual(proof['files'][name]['sha256'], shaders.sha(REPO / name))
+        snapshot.verify(self.root / 'source', proof, originals=True)
+
+    def resources(self):
+        source = self.root / 'resources'
+        (source / 'dm').mkdir(parents=True)
+        (source / 'dm/main.fixups.tsv').write_bytes(b'declared runtime metadata')
+        (source / 'shader.metallib').write_bytes(b'declared source MSL')
+        return source, snapshot.fingerprint(source)
+
+    def package(self, source, proof, name='app'):
+        app = self.root / name
+        app.mkdir()
+        (app / 'executable').write_bytes(b'generated executable')
+        snapshot.package_resources(source, app, proof, {'executable'})
+        return app
+
+    def test_post_link_resource_packaging_and_final_negatives(self):
+        source, proof = self.resources()
+        app = self.package(source, proof)
+        snapshot.verify_package(app, proof, {'executable'})
+        path = app / 'dm/main.fixups.tsv'
+        original = path.read_bytes()
+        path.write_bytes(b'corrupted runtime table')
+        with self.assertRaisesRegex(ValueError, 'resource identity changed'):
+            snapshot.verify_package(app, proof, {'executable'})
+        path.write_bytes(original)
+        path.unlink()
+        with self.assertRaisesRegex(ValueError, 'file set changed'):
+            snapshot.verify_package(app, proof, {'executable'})
+        path.write_bytes(original)
+        (app / 'extra-resource').write_bytes(b'not declared')
+        with self.assertRaisesRegex(ValueError, 'file set changed'):
+            snapshot.verify_package(app, proof, {'executable'})
+
+    def test_staged_source_cannot_rebaseline_changed_resource(self):
+        source, proof = self.resources()
+        (source / 'shader.metallib').write_bytes(b'changed after declared snapshot')
+        with self.assertRaisesRegex(ValueError, 'identity changed'):
+            self.package(source, proof)
+
+    def test_packaging_copy_corruption_is_rejected(self):
+        source, proof = self.resources()
+        original_copy = snapshot.shutil.copyfile
+        def corrupting_copy(src, dst):
+            original_copy(src, dst)
+            Path(dst).write_bytes(b'corruption after copy')
+        with mock.patch.object(snapshot.shutil, 'copyfile', corrupting_copy):
+            with self.assertRaisesRegex(ValueError, 'resource identity changed'):
+                self.package(source, proof)
+
     def cache(self):
         self.key = 'a' * 16
         self.chain = 'b' * 12
@@ -178,6 +304,17 @@ class Contracts(unittest.TestCase):
                          {self.key + '_b.json', self.key + '_b.metallib', self.key + '_bf.metallib'})
         with self.assertRaises(FileExistsError):
             shaders.stage(self.cache_path, self.manifest, result, fetch.variant, {self.key}, {self.key})
+
+    def test_shader_staging_copy_corruption_is_rejected(self):
+        self.cache()
+        original_copy = shaders.shutil.copyfile
+        def corrupting_copy(src, dst):
+            original_copy(src, dst)
+            Path(dst).write_bytes(b'corruption after copy')
+        with mock.patch.object(shaders.shutil, 'copyfile', corrupting_copy):
+            with self.assertRaisesRegex(ValueError, 'staged source shader identity'):
+                shaders.stage(self.cache_path, self.manifest, self.root / 'stage',
+                              fetch.variant, {self.key}, {self.key})
 
     def test_wrong_json_chain(self):
         self.cache()

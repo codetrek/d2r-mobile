@@ -88,4 +88,6 @@ def stage(cache, manifest, destination, fetch_variant, bf_want, expected_keys):
     for name in proof['identities']:
         if name.endswith(('.json', '.metallib')) and name != '_b_build.json':
             shutil.copyfile(Path(cache) / name, destination / name)
+            if sha(destination / name) != proof['identities'][name]:
+                raise ValueError('staged source shader identity mismatch: ' + name)
     return proof
