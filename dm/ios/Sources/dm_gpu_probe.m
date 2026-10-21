@@ -13,6 +13,7 @@
 #include "../../host/dm_vm.h"
 #include "../../gfx/nvn/nvn_buffer_identity.h"
 #include "../../gfx/nvn/nvn_ordered_constants.h"
+#include "../../gfx/nvn/nvn_depth_dummy.h"
 #include "../../gfx/nvn/nvn_native_arguments.h"
 #include "dm_gpu_probe_checkpoint.h"
 
@@ -210,6 +211,110 @@ static NSDictionary *compute_at(id<MTLDevice> device, id<MTLCommandQueue> queue,
 static NSDictionary *compute(id<MTLDevice> device, id<MTLCommandQueue> queue, BOOL arguments,
                              id<MTLBuffer> supplied, const uint32_t *observed, DmGpuMemory *owner) {
     return compute_at(device, queue, arguments, supplied, observed, owner, 0, nil, nil);
+}
+
+static NSDictionary *private_depth(id<MTLDevice> device, id<MTLCommandQueue> queue, BOOL (^publish)(NSDictionary *)) {
+    NSMutableDictionary *result = [@{@"status": @"pending", @"stage": @"compile_depth_reader"} mutableCopy];
+    NSDictionary *(^failed)(NSString *, NSString *, NSError *) = ^NSDictionary *(NSString *status, NSString *stage, NSError *error) {
+        [result addEntriesFromDictionary:failure(status, stage, error)]; return result;
+    };
+    if (!publish(result)) return failed(@"error", @"result_persistence", nil);
+    // Explicit level-zero depth sampling/read signatures are defined in MSL6.13.10/11/14.
+    // https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
+    NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct A { depth2d<float> d [[id(0)]]; depth2d_array<float> a [[id(1)]]; depthcube<float> c [[id(2)]]; device float *out [[id(3)]]; };"
+        "kernel void depth_read(constant A &a [[buffer(0)]], constant uint &base [[buffer(1)]]) {"
+        "constexpr sampler s(coord::normalized,address::clamp_to_edge,filter::nearest);"
+        "a.out[base]=a.d.sample(s,float2(.5f),level(0.0f)); a.out[base+1]=a.a.sample(s,float2(.5f),0u,level(0.0f));"
+        "float3 dirs[6]={float3(1,0,0),float3(-1,0,0),float3(0,1,0),float3(0,-1,0),float3(0,0,1),float3(0,0,-1)};"
+        "for(uint i=0;i<6;i++)a.out[base+2+i]=a.c.sample(s,dirs[i],level(0.0f));"
+        "a.out[base+8]=a.d.read(uint2(0),0u); a.out[base+9]=a.a.read(uint2(0),0u,0u);"
+        "for(uint i=0;i<6;i++)a.out[base+10+i]=a.c.read(uint2(0),i,0u); }";
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    if (!library) return failed(@"error", @"depth_library", error);
+    id<MTLFunction> function = [library newFunctionWithName:@"depth_read"];
+    if (!function) return failed(@"error", @"depth_function", nil);
+    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+    if (!pipeline) return failed(@"error", @"depth_pipeline", error);
+    id<MTLArgumentEncoder> arguments = [function newArgumentEncoderWithBufferIndex:0];
+    if (!arguments || !nvn_sim_argument_layout(arguments.encodedLength, arguments.alignment))
+        return failed(@"unsupported", @"depth_argument_layout", nil);
+    NvnDepthDummies *cache = [[NvnDepthDummies alloc] initWithDevice:device];
+    id<MTLBuffer> output = [device newBufferWithLength:256 options:MTLResourceStorageModeShared];
+    if (!cache || !output) return failed(@"error", @"depth_allocation", nil);
+    memset(output.contents, 0xCD, output.length);
+    MTLTextureType types[] = {MTLTextureType2D, MTLTextureType2DArray, MTLTextureTypeCube};
+    NSArray *originalTextures = nil;
+    for (unsigned phase = 0; phase < 2; phase++) {
+        @autoreleasepool {
+            result[@"stage"] = @"depth_prepare"; result[@"phase_pending"] = @(phase);
+            if (!publish(result)) return failed(@"error", @"result_persistence", nil);
+            id<MTLCommandBuffer> command = [queue commandBuffer];
+            if (!command || !command.retainedReferences) return failed(@"error", @"depth_retained_command", nil);
+            NSMutableArray<id<MTLTexture>> *textures = [NSMutableArray array];
+            for (unsigned i = 0; i < 3; i++) {
+                result[@"stage"] = @"depth_prepare"; result[@"type_pending"] = @(types[i]);
+                if (!publish(result)) return failed(@"error", @"result_persistence", nil);
+                NvnDepthStatus status = [cache prepareType:types[i] command:command serial:phase+1];
+                if (status) { result[@"type_pending"] = @(types[i]); result[@"helper_status"] = @(status); return failed(@"error", @"depth_prepare", nil); }
+                id<MTLTexture> texture = [cache textureForType:types[i] serial:phase+1];
+                if (!texture) return failed(@"error", @"depth_cache_lookup", nil);
+                [textures addObject:texture];
+                if (!phase) {
+                    result[@"stage"] = @"depth_seed_clear";
+                    if (!publish(result)) return failed(@"error", @"result_persistence", nil);
+                    if (nvn_depth_dummy_clear(command, texture, types[i], .625)) return failed(@"error", @"depth_seed_clear", nil);
+                }
+            }
+            [result removeObjectForKey:@"type_pending"];
+            NSMutableArray *properties = [NSMutableArray array];
+            for (id<MTLTexture> texture in textures) [properties addObject:@{
+                @"class": NSStringFromClass(texture.class), @"type": @(texture.textureType), @"format": @(texture.pixelFormat),
+                @"storage": @(texture.storageMode), @"hazard_mode": @(texture.hazardTrackingMode), @"usage": @(texture.usage),
+                @"width": @(texture.width), @"height": @(texture.height), @"depth": @(texture.depth), @"array_length": @(texture.arrayLength),
+                @"mip_levels": @(texture.mipmapLevelCount), @"sample_count": @(texture.sampleCount), @"same_device": @(texture.device == device)}];
+            result[@"textures"] = properties;
+            if (!phase) originalTextures = [textures copy];
+            else for (unsigned i = 0; i < 3; i++) if (textures[i] != originalTextures[i]) return failed(@"error", @"depth_cache_reuse", nil);
+            id<MTLBuffer> encoded = [device newBufferWithLength:arguments.encodedLength options:MTLResourceStorageModeShared];
+            if (!encoded) return failed(@"error", @"depth_arguments", nil);
+            [arguments setArgumentBuffer:encoded offset:0];
+            for (NSUInteger i = 0; i < 3; i++) [arguments setTexture:textures[i] atIndex:i];
+            [arguments setBuffer:output offset:0 atIndex:3];
+            id<MTLComputeCommandEncoder> reader = [command computeCommandEncoder];
+            if (!reader) return failed(@"error", @"depth_reader_encoder", nil);
+            [reader setComputePipelineState:pipeline]; [reader setBuffer:encoded offset:0 atIndex:0];
+            uint32_t base = phase*16; [reader setBytes:&base length:sizeof base atIndex:1];
+            for (id<MTLTexture> texture in textures) [reader useResource:texture usage:MTLResourceUsageRead];
+            [reader useResource:output usage:MTLResourceUsageWrite];
+            [reader dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)]; [reader endEncoding];
+            dispatch_semaphore_t done = dispatch_semaphore_create(0);
+            [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+                (void)textures.count; (void)output.length; (void)encoded.length; (void)completed; dispatch_semaphore_signal(done);
+            }];
+            result[@"stage"] = @"depth_gpu_completion";
+            if (!publish(result)) return failed(@"error", @"result_persistence", nil);
+            [command commit];
+            if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 5*NSEC_PER_SEC))) return failed(@"timeout", @"depth_gpu_completion", nil);
+            if (command.status != MTLCommandBufferStatusCompleted) return failed(@"error", @"depth_gpu_completion", command.error);
+            const float *values = output.contents; BOOL match = YES;
+            for (unsigned i = 0; i < 16; i++) if (values[phase*16+i] != (phase ? 0 : .625f)) match = NO;
+            result[phase ? @"zero_phase_match" : @"seed_phase_match"] = @(match);
+            if (!match) return failed(@"error", @"depth_sample_readback", nil);
+            result[@"completed_phases"] = @(phase+1);
+        }
+    }
+    const uint32_t *words = output.contents; BOOL guards = YES;
+    for (unsigned i = 32; i < 64; i++) if (words[i] != UINT32_C(0xcdcdcdcd)) guards = NO;
+    [result removeObjectForKey:@"phase_pending"];
+    result[@"type_names"] = @[@"2d", @"2d_array", @"cube"]; result[@"cube_faces"] = @6;
+    result[@"format"] = @"Depth32Float"; result[@"storage"] = @"private"; result[@"tracked"] = @YES;
+    result[@"usage"] = @"shader_read|render_target"; result[@"cache_objects_reused"] = @YES;
+    result[@"samples_per_phase"] = @8; result[@"reads_per_phase"] = @8; result[@"total_values"] = @32;
+    result[@"surrounding_bytes_unchanged"] = @(guards);
+    result[@"argument_encoded_length"] = @(arguments.encodedLength); result[@"argument_alignment"] = @(arguments.alignment);
+    result[@"status"] = guards ? @"passed" : @"error"; result[@"stage"] = @"depth_sample_readback"; return result;
 }
 
 static NSDictionary *ordered_constants(id<MTLDevice> device, id<MTLCommandQueue> queue, BOOL (^publish)(NSDictionary *)) {
@@ -516,6 +621,12 @@ int dm_gpu_probe(void) {
                 else if (!shared || ![queue respondsToSelector:@selector(addResidencySet:)]) tests[@"residency_set"] = failure(@"unsupported", @"queue_residency", nil);
                 else { [set addAllocation:shared]; [set commit]; [queue addResidencySet:set]; [queue removeResidencySet:set]; tests[@"residency_set"] = @{@"status": @"passed", @"queue_registration": @YES}; }
             }
+        }
+        if (selection == DM_GPU_CASE_DEPTH || selection == DM_GPU_CASE_ALL) {
+            if (!begin_test(result, path, @"private_depth")) return 1;
+            tests[@"private_depth"] = private_depth(device, queue, ^BOOL(NSDictionary *detail) {
+                tests[@"private_depth"] = detail; return write_report(result, path, NO);
+            });
         }
         if (selection == DM_GPU_CASE_CONSTANTS || selection == DM_GPU_CASE_ALL) {
             if (!begin_test(result, path, @"ordered_constants")) return 1;

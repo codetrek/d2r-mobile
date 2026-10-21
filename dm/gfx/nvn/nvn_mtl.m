@@ -20,6 +20,7 @@
 #include "nvn_buffer_identity.h"
 #include "nvn_native_arguments.h"
 #include "nvn_ordered_constants.h"
+#include "nvn_depth_dummy.h"
 // 编译期开关 DM_NVN_M3=1：图形后端走老接口（普通命令队列 / 命令缓冲 / 渲染与计算与拷贝编码器，逐槽绑定缓冲，对参数块引用的资源逐个声明），
 // 目标 macOS 15 / iOS 18。缺省 0 = Metal 4（macOS 26 / iOS 26）。两支共用同一份回放逻辑，分叉处都在 #if DM_NVN_M3 里
 // Compile-time switch DM_NVN_M3=1: the graphics backend uses the older API (ordinary command queue / command buffers / render, compute and copy encoders, buffers bound per slot, each resource referenced by an argument block declared individually),
@@ -3157,7 +3158,33 @@ static id<MTLDepthStencilState> dss_get(int has_depth, int has_stencil) {
 // Argument buffer: filled item by item per the B reflection (uniform slot r, separate texture / sampler slot r, storage buffer slot r, driver segments c0 / c2, c1, support_buffer)
 // Unbound resources read 0: give all-zero dummy resources (NVN descriptors 0..255 are reserved for the driver; the game binding handle 0 means 'this slot is empty')
 static uint64_t g_dummy_tex_rid[8][4], g_dummy_img_rid[8][4], g_dummy_tbuf_rid[4];
+#if DM_NVN_SIMULATOR
+static NvnDepthDummies *g_sim_depth_dummies;
+static void sim_prepare_depths(NvShader *shader) {
+    if (!shader || !shader->ae) return;
+    for (int i = 0; i < shader->rf.nb; i++) {
+        const nvn_rbind *binding = &shader->rf.b[i];
+        if (binding->dpf == NVN_DPF_DEPTH && (binding->kind == NVN_RB_IMG || binding->kind == NVN_RB_TBUF))
+            MDIE("Simulator writable/buffer depth fallback is unsupported");
+        if (binding->kind != NVN_RB_TEX || binding->dpf != NVN_DPF_DEPTH) continue;
+        if (!g_sim_depth_dummies) g_sim_depth_dummies = [[NvnDepthDummies alloc] initWithDevice:g_dev];
+        if (!g_sim_depth_dummies) MDIE("Simulator depth fallback cache allocation failed");
+        if ([g_sim_depth_dummies textureForType:binding->dtt serial:g_sub_serial]) continue;
+        if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+        NvnDepthStatus status = [g_sim_depth_dummies prepareType:binding->dtt command:g_cb serial:g_sub_serial];
+        if (status) MDIE("Simulator depth fallback preparation failed: type=%d status=%d", binding->dtt, status);
+        res_add([g_sim_depth_dummies textureForType:binding->dtt serial:g_sub_serial]);
+    }
+}
+#endif
 static id<MTLTexture> dummy_tex(int dtt, int dpf) {
+#if DM_NVN_SIMULATOR
+    if (dpf == NVN_DPF_DEPTH) {
+        id<MTLTexture> prepared = [g_sim_depth_dummies textureForType:(MTLTextureType)dtt serial:g_sub_serial];
+        if (!prepared) MDIE("Simulator depth fallback was not prepared before its consumer: type=%d", dtt);
+        return prepared;
+    }
+#endif
     static __strong id<MTLTexture> cache[8][4];
     MTLTextureType tt = (MTLTextureType)dtt;
     MTLPixelFormat pf = dpf == NVN_DPF_DEPTH ? MTLPixelFormatDepth32Float : dpf == NVN_DPF_UINT ? MTLPixelFormatRGBA32Uint : dpf == NVN_DPF_SINT ? MTLPixelFormatRGBA32Sint : MTLPixelFormatRGBA8Unorm;
@@ -3295,6 +3322,7 @@ static void sim_prepare_constants(NvShader *sh, int stage, double matrixOffset) 
     // Ending the old pass can replay a ghost draw recursively. Drain it before
     // constructing this draw's slots; restoring S does not restore prepared slots.
     rp_end();
+    sim_prepare_depths(sh);
     g_sim_constant_copy_begin = 1;
     for (int i = 0; i < NVN_REFL_MAXB; i++) g_sim_prepared[stage][i] = nil;
     if (!sh || !sh->ae) return;

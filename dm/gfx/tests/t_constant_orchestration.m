@@ -29,6 +29,10 @@ static int mtl_addr(uint64_t address, uint64_t length, void **buffer, uint64_t *
 }
 static void enc_b_end(id buffer) { (void)buffer; }
 static void rp_end(void);
+static void sim_prepare_depths(NvShader *shader) {
+    if (shader) for (int i = 0; i < shader->rf.nb; i++)
+        assert(shader->rf.b[i].kind != NVN_RB_TEX || shader->rf.b[i].dpf != NVN_DPF_DEPTH);
+}
 
 // This generated include is the complete, verbatim production preparation
 // region. Only the prior-pass callback is modeled; the actual pool records all

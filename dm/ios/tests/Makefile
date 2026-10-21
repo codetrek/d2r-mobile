@@ -51,9 +51,9 @@ $(GPU_PROBE_TARGET): t_gpu_probe_result.c ../Sources/dm_gpu_probe_result.h
 $(GPU_CHECKPOINT_TARGET): t_gpu_probe_checkpoint.m ../Sources/dm_gpu_probe_checkpoint.h
 	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fobjc-arc -fblocks t_gpu_probe_checkpoint.m -framework Foundation -o $@
-$(GPU_MEMORY_TARGET): t_gpu_probe_memory.m ../Sources/dm_gpu_probe.m ../Sources/dm_gpu_probe_result.h ../Sources/dm_gpu_probe_checkpoint.h ../../host/dm_vm.h ../../host/dm_vm_leases.h ../../gfx/nvn/nvn_buffer_identity.h ../../gfx/nvn/nvn_ordered_constants.h ../../gfx/nvn/nvn_ordered_constants.m ../../gfx/nvn/nvn_native_arguments.h
+$(GPU_MEMORY_TARGET): t_gpu_probe_memory.m ../Sources/dm_gpu_probe.m ../Sources/dm_gpu_probe_result.h ../Sources/dm_gpu_probe_checkpoint.h ../../host/dm_vm.h ../../host/dm_vm_leases.h ../../gfx/nvn/nvn_buffer_identity.h ../../gfx/nvn/nvn_ordered_constants.h ../../gfx/nvn/nvn_ordered_constants.m ../../gfx/nvn/nvn_depth_dummy.h ../../gfx/nvn/nvn_depth_dummy.m ../../gfx/nvn/nvn_native_arguments.h
 	mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -fobjc-arc -fblocks t_gpu_probe_memory.m ../../gfx/nvn/nvn_ordered_constants.m -framework Foundation -framework Metal -o $@
+	$(CC) $(CFLAGS) -fobjc-arc -fblocks t_gpu_probe_memory.m ../../gfx/nvn/nvn_ordered_constants.m ../../gfx/nvn/nvn_depth_dummy.m -framework Foundation -framework Metal -o $@
 test: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET) $(GPU_PROBE_TARGET) $(GPU_CHECKPOINT_TARGET) $(GPU_MEMORY_TARGET)
 	$(GPU_PROBE_TARGET)
 	$(GPU_CHECKPOINT_TARGET)

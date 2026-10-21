@@ -11,6 +11,7 @@ NATIVE_ARGUMENT_TEST=../../../.tmp/gfx-tests/t_native_arguments
 BUFFER_IDENTITY_TEST=../../../.tmp/gfx-tests/t_buffer_identity
 ORDERED_CONSTANT_TEST=../../../.tmp/gfx-tests/t_ordered_constants
 CONSTANT_ORCHESTRATION_TEST=../../../.tmp/gfx-tests/t_constant_orchestration
+DEPTH_DUMMY_TEST=../../../.tmp/gfx-tests/t_depth_dummy
 CONSTANT_PREPARATION_EXTRACT=../../../.tmp/gfx-tests/constant_preparation.inc
 # 宿主 crash.c 一并链入：写保护单测走生产同一套缺页钩子
 # Host crash.c is linked in as well: the write-protect unit tests go through the same page-fault hook as production
@@ -80,16 +81,21 @@ $(CONSTANT_PREPARATION_EXTRACT): extract_constant_preparation.py ../nvn/nvn_mtl.
 $(CONSTANT_ORCHESTRATION_TEST): t_constant_orchestration.m constant_recording.h $(CONSTANT_PREPARATION_EXTRACT) ../nvn/nvn_ordered_constants.h ../nvn/nvn_ordered_constants.m ../nvn/nvn_refl.h
 	mkdir -p $(@D)
 	clang -O2 -g -Wall -Wextra -Werror -fobjc-arc -I$(@D) -o $@ $< ../nvn/nvn_ordered_constants.m -framework Foundation -framework Metal
-simulator-bindings: $(SIMULATOR_BINDING_TEST) $(NATIVE_ARGUMENT_TEST) $(BUFFER_IDENTITY_TEST) $(ORDERED_CONSTANT_TEST) $(CONSTANT_ORCHESTRATION_TEST)
+$(DEPTH_DUMMY_TEST): t_depth_dummy.m ../nvn/nvn_depth_dummy.h ../nvn/nvn_depth_dummy.m
+	mkdir -p $(@D)
+	clang -O2 -g -Wall -Wextra -Werror -fobjc-arc -o $@ $< ../nvn/nvn_depth_dummy.m -framework Foundation -framework Metal
+simulator-bindings: $(SIMULATOR_BINDING_TEST) $(NATIVE_ARGUMENT_TEST) $(BUFFER_IDENTITY_TEST) $(ORDERED_CONSTANT_TEST) $(CONSTANT_ORCHESTRATION_TEST) $(DEPTH_DUMMY_TEST)
 	$(SIMULATOR_BINDING_TEST)
 	$(NATIVE_ARGUMENT_TEST)
 	$(BUFFER_IDENTITY_TEST)
 	$(ORDERED_CONSTANT_TEST)
 	$(CONSTANT_ORCHESTRATION_TEST)
+	$(DEPTH_DUMMY_TEST)
 .PHONY: simulator-bindings
 # 依赖一行一个、按字母序（免得加一个测试就整行冲突）；下面各条命令的先后不变
 # Dependencies one per line in alphabetical order (so that adding one test does not conflict on the whole line); the order of the commands below is unchanged
 run: \
+	$(DEPTH_DUMMY_TEST) \
 	$(CONSTANT_ORCHESTRATION_TEST) \
 	$(ORDERED_CONSTANT_TEST) \
 	$(BUFFER_IDENTITY_TEST) \
