@@ -5,6 +5,7 @@ TARGET = t_touch_controls
 METAL_CACHE_TARGET = t_metal_cache_guard
 GPU_PROBE_TARGET = ../../../.tmp/ios-tests/t_gpu_probe_result
 GPU_CHECKPOINT_TARGET = ../../../.tmp/ios-tests/t_gpu_probe_checkpoint
+GPU_MEMORY_TARGET = ../../../.tmp/ios-tests/t_gpu_probe_memory
 BINDING_TARGETS = t_native_binding t_game_bridge t_binding_freshness t_portal_sequence t_binding_group t_native_hud_identity t_native_hud_bridge
 BINDING_FIXTURES = fixtures/native_binding/mapping.bin fixtures/native_binding/bindings.bin
 # 这两份夹具是从运行中的游戏内存抓下来的两张表，公开仓库不带（见 fixtures/native_binding/README）。不在就跳过要读它们的三个测试并说明，别的照跑
@@ -13,7 +14,7 @@ HAVE_BINDING_FIXTURES := $(and $(wildcard fixtures/native_binding/mapping.bin),$
 fixture_test = $(if $(HAVE_BINDING_FIXTURES),./$(1) $(BINDING_FIXTURES),@echo "跳过 $(1)：没有夹具 $(BINDING_FIXTURES)（公开仓库不带，要自己从运行中的游戏抓，见 fixtures/native_binding/README）")
 
 .PHONY: all run test clean
-all: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET) $(GPU_PROBE_TARGET) $(GPU_CHECKPOINT_TARGET)
+all: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET) $(GPU_PROBE_TARGET) $(GPU_CHECKPOINT_TARGET) $(GPU_MEMORY_TARGET)
 run: test
 $(TARGET): t_touch_controls.c $(wildcard ../Sources/dm_touch_controls.[ch]) ../../host/dm_input.h
 	$(CC) $(CFLAGS) -I../Sources t_touch_controls.c ../Sources/dm_touch_controls.c -lm -o $@
@@ -50,9 +51,13 @@ $(GPU_PROBE_TARGET): t_gpu_probe_result.c ../Sources/dm_gpu_probe_result.h
 $(GPU_CHECKPOINT_TARGET): t_gpu_probe_checkpoint.m ../Sources/dm_gpu_probe_checkpoint.h
 	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fobjc-arc -fblocks t_gpu_probe_checkpoint.m -framework Foundation -o $@
-test: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET) $(GPU_PROBE_TARGET) $(GPU_CHECKPOINT_TARGET)
+$(GPU_MEMORY_TARGET): t_gpu_probe_memory.m ../Sources/dm_gpu_probe.m ../Sources/dm_gpu_probe_result.h ../Sources/dm_gpu_probe_checkpoint.h
+	mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fobjc-arc -fblocks t_gpu_probe_memory.m -framework Foundation -framework Metal -o $@
+test: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET) $(GPU_PROBE_TARGET) $(GPU_CHECKPOINT_TARGET) $(GPU_MEMORY_TARGET)
 	$(GPU_PROBE_TARGET)
 	$(GPU_CHECKPOINT_TARGET)
+	$(GPU_MEMORY_TARGET)
 	python3 test_simulator.py
 	./$(METAL_CACHE_TARGET)
 	./$(TARGET)
@@ -76,4 +81,4 @@ test: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL
 	python3 test_skill_aim_front.py
 	python3 test_touch_receipt.py --source ../Sources/front_ios.m
 clean:
-	rm -f $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET) $(GPU_PROBE_TARGET) $(GPU_CHECKPOINT_TARGET)
+	rm -f $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET) $(GPU_PROBE_TARGET) $(GPU_CHECKPOINT_TARGET) $(GPU_MEMORY_TARGET)

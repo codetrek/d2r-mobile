@@ -3,6 +3,12 @@
 #include <stdio.h>
 
 int main(void) {
+    const char *cases[] = {"core", "residency", "nocopy-malloc", "nocopy-vm", "nocopy-shared", "buffer-alias", "all"};
+    for (int i = 0; i < 7; i++) assert(dm_gpu_probe_parse_case(cases[i]) == (enum dm_gpu_probe_case)i);
+    assert(dm_gpu_probe_parse_case(NULL) == DM_GPU_CASE_INVALID);
+    assert(dm_gpu_probe_parse_case("") == DM_GPU_CASE_INVALID);
+    assert(dm_gpu_probe_parse_case("core-extra") == DM_GPU_CASE_INVALID);
+    assert(dm_gpu_probe_parse_case("Core") == DM_GPU_CASE_INVALID);
     uint32_t words[DM_GPU_PROBE_WORDS];
     for (size_t i = 0; i < DM_GPU_PROBE_WORDS; i++) words[i] = ((uint32_t)i + 1u) ^ UINT32_C(0x5a5a5a5a);
     assert(words[0] == UINT32_C(0x5a5a5a5b));

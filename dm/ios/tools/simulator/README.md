@@ -53,19 +53,37 @@ python3 dm/ios/tests/test_simulator.py
 
 ## Host GPU 诊断
 
-显式启动应用并传 `-mode gpu`，应用只调用公开 Metal API，结果写入自己的 `Documents/gpu-<PID>-<UUID>.json`。这一路径不启动宿主游戏、不装载 Guest，也不放宽游戏前置检查。
+显式启动应用并传 `-mode gpu`。应用不装载 Guest，不改变游戏前置检查，结果写入自己的 `Documents/gpu-<PID>-<UUID>.json`。`d2r.host-gpu-probe.v2` 记录实际设备名、类、registryID、architecture、Metal3/Apple2/BC/统一内存/参数缓冲层级和 Metal/AGX 加载路径，也记录公开的 `buffer.device`、`queue.device` 及 `same_as_default`。这些访问器本身不构成物理宿主 GPU 证明。
 
-结果记录实际设备名、Objective-C 类、registryID、architecture、真实 Metal3/Apple2/BC/统一内存/参数缓冲层级，以及已加载的 Metal/AGX 映像路径。同时记录 `buffer.device`、`queue.device` 的公开设备信息和 `same_as_default`，保留它们返回模拟器包装设备或其他设备的真实结果。iOS 的公开 MTLDevice 接口没有直接的 parent-device accessor；设备名和这些访问器本身均不构成物理 GPU 能力证明。
+用 `DM_GPU_PROBE_CASE` 选择案例；经 simctl 启动时设置 `SIMCTL_CHILD_DM_GPU_PROBE_CASE`。缺省为 `core`；未知、空或大小写不匹配的名字在创建诊断 Metal 设备前被拒绝，并以代码 2 退出。
 
-检查仅使用自有 16 KiB 缓冲和 64 个 uint32 元素：共享与零复制缓冲、GPU 地址 API 是否可用及是否非零、驻留集和队列登记、直接计算，以及参数编码器计算。两份计算核都要求 GPU 写回完整的确定结果，每次 GPU 完成等待上限为 5 秒。每项返回 passed、unsupported、error 或 timeout；状态不合并成游戏可用结论。每项开始前保存未完成报告与 pending_test，包含队列创建之前的检查点，因此中途系统断言或退出有明确阶段；CPU 状态测试覆盖已完成缓冲结果保留、队列故障前的待执行状态和写盘失败时不执行后续操作。外部启动器仍应设置整个进程的有限期限。
+| 案例 | 请求的检查 |
+|---|---|
+| `core` | 共享缓冲、队列、64 元素直接计算和参数编码器计算 |
+| `residency` | core 加驻留集创建及队列登记 |
+| `nocopy-malloc` | core 加 posix_memalign 内存的零复制包装与原内存 GPU 变换回读 |
+| `nocopy-vm` | core 加独立 vm_allocate 区域的相同检查 |
+| `nocopy-shared` | core 加 MAP_SHARED 匿名映射的相同检查 |
+| `buffer-alias` | core 加 MTLBuffer 自有共享页映射到新建区域，核对 CPU 别名写入和 GPU 变换回读 |
+| `all` | 先 core，再逐项检查可选路径；可选 API 的系统断言仍会结束该进程 |
 
-CPU 结果检查可独立运行：
+每种可选路径均先保留 core 结果。资格检查按独立应用进程分别启动案例，避免一次系统断言挡住其他案例。仅使用新建的自有 16 KiB 数据区域与 64 个 uint32；不会映射或改写 Guest 池、代码页或用户数据。
+
+零复制案例记录分配 API、页大小与对齐、单一 VM 区域范围、读写权限和共享属性，并在包装 API 调用前保存这些结果。构造或指针相等不足以通过：GPU 必须原地变换数据，且从原先自有内存读回完整的预期结果。buffer-alias 使用 copy=false 的 vm_remap，只覆盖刚创建的自有目标区域，并核对目标地址与读写权限。映射及缓冲由所有者对象持有，GPU 完成回调继续持有它，因此 CPU 等待超时也不会提前释放在途资源。
+
+每次 GPU 完成等待上限为 5 秒；外部启动器还须设置同步 API 在内的整个进程期限。结果分别标明 passed、unsupported、error 或 timeout，不合并成游戏可用结论。每项开始前写 pending_test，内存包装与重映射前另写分配契约；中途退出仍保留真实的未完成状态。
+
+CPU 检查不调用 Metal 设备创建或 GPU 提交：
 
 ```sh
-make -C dm/ios/tests ../../../.tmp/ios-tests/t_gpu_probe_result
+make -C dm/ios/tests ../../../.tmp/ios-tests/t_gpu_probe_result ../../../.tmp/ios-tests/t_gpu_probe_checkpoint ../../../.tmp/ios-tests/t_gpu_probe_memory
 .tmp/ios-tests/t_gpu_probe_result
-make -C dm/ios/tests ../../../.tmp/ios-tests/t_gpu_probe_checkpoint
 .tmp/ios-tests/t_gpu_probe_checkpoint
+.tmp/ios-tests/t_gpu_probe_memory
 ```
 
-Apple 的[模拟器 Metal 指南](https://developer.apple.com/documentation/metal/developing-metal-apps-that-run-in-simulator)说明模拟器提供近似 Apple family2 的功能，且不支持片元输入读取颜色附件。宿主硬件型号和模拟器机型都不能替代这些能力与计算检查。诊断代码尚需在自己的新候选中实际运行；既有 blank 画面不证明完整渲染器或 BF 路径可用。
+它们覆盖确定输出、非法案例名、未完成报告顺序、三种分配方式、自有 VM 区域别名和完成回调生命周期。它们不能替代 GPU 运行回执。
+
+历史 diagnostic06 安装后身份匹配；实际返回 MTLSimDevice、Apple2、Tier1、Metal3/BC/统一内存为 false，共享缓冲有非零 GPU 地址。随后 malloc 后端的零复制包装触发 libxpc 断点，partial JSON 和 IPS 原样保留；尚未得到该产物的队列及计算结果。新增分配案例与别名策略目前仅通过 CPU/编译检查，需在新的固定产物中实际运行。
+
+Apple 的[模拟器 Metal 指南](https://developer.apple.com/documentation/metal/developing-metal-apps-that-run-in-simulator)说明模拟器提供近似 Apple family2 的功能，且不支持片元输入读取颜色附件。[零复制缓冲 API](https://developer.apple.com/documentation/metal/mtldevice/makebuffer(bytesnocopy:length:options:deallocator:))还要求页对齐和单一 VM 区域。宿主硬件型号与模拟器机型均不能替代这些契约和计算检查。
