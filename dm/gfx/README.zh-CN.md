@@ -27,7 +27,7 @@ English: [README.md](README.md)
 
 各 NVN 对象与命令落到 Metal 的哪个对象，见 [nvn_metal_mapping.zh-CN.md](nvn_metal_mapping.zh-CN.md)。
 
-源码中的显式 `DM_NVN_SIMULATOR=1` 配置使用原生 `MTLArgumentEncoder` setter、实际编码长度及对齐，以及仅用于宿主对象反查的缓冲标记。经典资源登记与不可用的驻留集 API 分开，保留间接资源用途声明及栅栏延迟释放，并排除 BF/TBDR 路径；参数 arena 和 c1 缓冲不超过 64 KiB。缓冲绑定按编译器反射的最小类型尺寸及对齐、NVN 请求全长和后备范围检查，未知或不足的范围在调用 setter 前被拒绝。当前构建工具尚未选择此配置，原游戏池所有权、uniform 有序适配、完整格式及配套派生着色器仍需完成验证。设备默认路径与游戏启动检查保持原样。从仓库根目录运行 `make -C dm/gfx/tests simulator-bindings` 可执行 CPU 策略及缓冲标记检查，产物留在 `.tmp`。
+显式 `DM_NVN_SIMULATOR=1` 源码配置使用原生参数 setter、实际指针最小类型/布局反射、完整 NVN 范围和宿主缓冲标记。经典资源登记及栅栏释放与驻留集 API 分开，BF/TBDR 不适用，参数/c1 后备不超过 64 KiB。模拟器用 vm_allocate 预留 AS；池创建核对完整页范围、单一可读写 VM 区域、AS 所有权和设备上限。租约阻止后备页在池退役前被丢弃；录制中的池按实际计划栅栏退役，未录制时等已提交工作后退役，仍存活的缓冲引用在 GPU 完成后继续保留租约。CPU/编译检查通过，保护区 GPU 用例尚未运行。构建器须待有序常量、完整格式、派生配置/PSO 整合和真实渲染资格通过后选择此配置；设备默认和启动检查保持原样。从根目录运行 `make -C dm/gfx/tests simulator-bindings` 可执行 CPU 绑定检查，产物留在 `.tmp`。注册身份检查在局部自动释放池内读取 contents，只返回布尔值，避免 ARC 将内存池包装对象额外保留到长驻调用线程的外层池。O2 CPU 检查用同样的内部指针注解验证外层池仍存活时的释放时序。
 
 ### 着色器翻译链
 

@@ -8,6 +8,7 @@ GFX_H=$(wildcard ../nvn/*.h ../nvn/*.inc ../nvn/include/*.h ../tex/*.h)
 FW=-framework Metal -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework UniformTypeIdentifiers
 SIMULATOR_BINDING_TEST=../../../.tmp/gfx-tests/t_simulator_bindings
 NATIVE_ARGUMENT_TEST=../../../.tmp/gfx-tests/t_native_arguments
+BUFFER_IDENTITY_TEST=../../../.tmp/gfx-tests/t_buffer_identity
 # 宿主 crash.c 一并链入：写保护单测走生产同一套缺页钩子
 # Host crash.c is linked in as well: the write-protect unit tests go through the same page-fault hook as production
 t_nvn: t_nvn.c ../nvn/hle_nvn.c ../../host/crash.c $(GFX) $(GFX_H)
@@ -64,13 +65,18 @@ $(SIMULATOR_BINDING_TEST): t_simulator_bindings.c ../nvn/nvn_buffer_map.h ../nvn
 $(NATIVE_ARGUMENT_TEST): t_native_arguments.m ../nvn/nvn_native_arguments.h ../nvn/nvn_buffer_map.h ../nvn/nvn_simulator.h
 	mkdir -p $(@D)
 	clang -O1 -g -Wall -Wextra -Werror -fobjc-arc -o $@ $< -framework Foundation
-simulator-bindings: $(SIMULATOR_BINDING_TEST) $(NATIVE_ARGUMENT_TEST)
+$(BUFFER_IDENTITY_TEST): t_buffer_identity.m ../nvn/nvn_buffer_identity.h
+	mkdir -p $(@D)
+	clang -O2 -g -Wall -Wextra -Werror -fobjc-arc -o $@ $< -framework Foundation
+simulator-bindings: $(SIMULATOR_BINDING_TEST) $(NATIVE_ARGUMENT_TEST) $(BUFFER_IDENTITY_TEST)
 	$(SIMULATOR_BINDING_TEST)
 	$(NATIVE_ARGUMENT_TEST)
+	$(BUFFER_IDENTITY_TEST)
 .PHONY: simulator-bindings
 # 依赖一行一个、按字母序（免得加一个测试就整行冲突）；下面各条命令的先后不变
 # Dependencies one per line in alphabetical order (so that adding one test does not conflict on the whole line); the order of the commands below is unchanged
 run: \
+	$(BUFFER_IDENTITY_TEST) \
 	$(SIMULATOR_BINDING_TEST) \
 	$(NATIVE_ARGUMENT_TEST) \
 	t_copy_pitch \
@@ -99,6 +105,7 @@ run: \
 	t_xv \
 	t_zskip
 	./t_copy_pitch
+	$(BUFFER_IDENTITY_TEST)
 	$(SIMULATOR_BINDING_TEST)
 	$(NATIVE_ARGUMENT_TEST)
 	./t_nvn

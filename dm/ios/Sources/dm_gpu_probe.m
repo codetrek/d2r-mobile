@@ -8,7 +8,10 @@
 #include <sys/mman.h>
 #include <mach/mach.h>
 #include <errno.h>
+#include <pthread.h>
 #include "dm_gpu_probe_result.h"
+#include "../../host/dm_vm.h"
+#include "../../gfx/nvn/nvn_buffer_identity.h"
 #include "dm_gpu_probe_checkpoint.h"
 
 void plog(const char *format, ...);
@@ -62,7 +65,24 @@ static BOOL begin_test(NSMutableDictionary *result, NSString *path, NSString *te
 
 
 enum Backing { BackingMalloc, BackingVM, BackingShared };
-@interface DmGpuMemory : NSObject
+static dm_vm_pool_leases g_probe_leases = {.next = 1};
+static pthread_mutex_t g_probe_lease_lock = PTHREAD_MUTEX_INITIALIZER;
+static void probe_lease_release(uint64_t lease) {
+    pthread_mutex_lock(&g_probe_lease_lock);
+    kern_return_t code = dm_vm_lease_release(&g_probe_leases, lease);
+    pthread_mutex_unlock(&g_probe_lease_lock);
+    if (code != KERN_SUCCESS) { plog("GPU probe lease release failed: %d", code); abort(); }
+}
+static int probe_vm_change(void *memory, size_t length, int protection, int discard) {
+    pthread_mutex_lock(&g_probe_lease_lock);
+    int result = dm_vm_change(&g_probe_leases, memory, length, protection, discard);
+    int error = errno; pthread_mutex_unlock(&g_probe_lease_lock); errno = error; return result;
+}
+static unsigned probe_lease_count(void) {
+    pthread_mutex_lock(&g_probe_lease_lock); unsigned count = g_probe_leases.count;
+    pthread_mutex_unlock(&g_probe_lease_lock); return count;
+}
+@interface DmGpuMemory : NSObject { @public _Atomic uint64_t pool_lease; }
 @property void *pointer;
 @property size_t length;
 @property enum Backing backing;
@@ -70,6 +90,7 @@ enum Backing { BackingMalloc, BackingVM, BackingShared };
 @end
 @implementation DmGpuMemory
 - (void)dealloc {
+    dm_vm_lease_retire(&pool_lease, probe_lease_release);
     _buffer = nil;
     if (_pointer) {
         if (_backing == BackingMalloc) free(_pointer);
@@ -124,8 +145,9 @@ static DmGpuMemory *allocate_memory(enum Backing backing, NSMutableDictionary *d
     return owner;
 }
 
-static NSDictionary *compute(id<MTLDevice> device, id<MTLCommandQueue> queue, BOOL arguments,
-                             id<MTLBuffer> supplied, const uint32_t *observed, DmGpuMemory *owner) {
+static NSDictionary *compute_at(id<MTLDevice> device, id<MTLCommandQueue> queue, BOOL arguments,
+                             id<MTLBuffer> supplied, const uint32_t *observed, DmGpuMemory *owner,
+                             NSUInteger bufferOffset, id<MTLSharedEvent> gate, void (^submitted)(id<MTLCommandBuffer>)) {
     BOOL transform = supplied != nil;
     NSString *body = transform ? @"out[i] = out[i]^0x5a5a5a5au;" : @"out[i] = (i+1u)^0x5a5a5a5au;";
     NSString *source = [@"#include <metal_stdlib>\nusing namespace metal;\n" stringByAppendingString:arguments
@@ -141,6 +163,8 @@ static NSDictionary *compute(id<MTLDevice> device, id<MTLCommandQueue> queue, BO
     id<MTLBuffer> output = supplied;
     if (!output) output = [device newBufferWithLength:DM_GPU_PROBE_WORDS * sizeof(uint32_t) options:MTLResourceStorageModeShared];
     if (!output || !output.contents) return failure(@"error", @"shared_output", nil);
+    if (bufferOffset > output.length || DM_GPU_PROBE_WORDS * sizeof(uint32_t) > output.length - bufferOffset)
+        return failure(@"error", @"output_range", nil);
     if (!transform) memset(output.contents, 0, output.length);
     id<MTLArgumentEncoder> argumentEncoder = nil;
     id<MTLBuffer> argumentBuffer = nil;
@@ -150,13 +174,15 @@ static NSDictionary *compute(id<MTLDevice> device, id<MTLCommandQueue> queue, BO
         argumentBuffer = [device newBufferWithLength:argumentEncoder.encodedLength options:MTLResourceStorageModeShared];
         if (!argumentBuffer) return failure(@"error", @"argument_buffer", nil);
         [argumentEncoder setArgumentBuffer:argumentBuffer offset:0];
-        [argumentEncoder setBuffer:output offset:0 atIndex:0];
+        [argumentEncoder setBuffer:output offset:bufferOffset atIndex:0];
     }
     id<MTLCommandBuffer> command = [queue commandBuffer];
+    if (!command || !command.retainedReferences) return failure(@"error", @"command_buffer_retention", nil);
+    if (gate) [command encodeWaitForEvent:gate value:1];
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     if (!command || !encoder) return failure(@"error", @"command_encoder", nil);
     [encoder setComputePipelineState:pipeline];
-    [encoder setBuffer:arguments ? argumentBuffer : output offset:0 atIndex:0];
+    [encoder setBuffer:arguments ? argumentBuffer : output offset:arguments ? 0 : bufferOffset atIndex:0];
     if (arguments) [encoder useResource:output usage:MTLResourceUsageRead | MTLResourceUsageWrite];
     [encoder dispatchThreadgroups:MTLSizeMake(DM_GPU_PROBE_WORDS, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     [encoder endEncoding];
@@ -167,14 +193,99 @@ static NSDictionary *compute(id<MTLDevice> device, id<MTLCommandQueue> queue, BO
         dispatch_semaphore_signal(done);
     }];
     [command commit];
+    if (submitted) submitted(command);
     if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)))
         return failure(@"timeout", @"gpu_completion", nil);
     if (command.status != MTLCommandBufferStatusCompleted) return failure(@"error", @"gpu_completion", command.error);
     BOOL matches = dm_gpu_probe_check(observed ? observed : output.contents, DM_GPU_PROBE_WORDS) == DM_GPU_PROBE_MATCH;
     NSMutableDictionary *result = [@{@"status": matches ? @"passed" : @"error", @"stage": @"readback",
                                      @"word_count": @(DM_GPU_PROBE_WORDS), @"output_match": @(matches),
-                                     @"command_completed": @YES, @"in_place_transform": @(transform)} mutableCopy];
+                                     @"command_completed": @YES, @"command_retained_references": @(command.retainedReferences), @"in_place_transform": @(transform)} mutableCopy];
     if (arguments) { result[@"argument_encoded_length"] = @(argumentEncoder.encodedLength); result[@"argument_alignment"] = @(argumentEncoder.alignment); }
+    return result;
+}
+
+static NSDictionary *compute(id<MTLDevice> device, id<MTLCommandQueue> queue, BOOL arguments,
+                             id<MTLBuffer> supplied, const uint32_t *observed, DmGpuMemory *owner) {
+    return compute_at(device, queue, arguments, supplied, observed, owner, 0, nil, nil);
+}
+
+static NSDictionary *protected_pool(id<MTLDevice> device, id<MTLCommandQueue> queue, BOOL (^publish)(NSDictionary *)) {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    NSDictionary *(^failed)(NSString *, NSError *) = ^NSDictionary *(NSString *stage, NSError *error) {
+        [result addEntriesFromDictionary:failure(@"error", stage, error)]; return result;
+    };
+    DmGpuMemory *owner = [DmGpuMemory new]; owner.backing = BackingVM; owner.length = 8u << 20;
+    void *reservation = NULL;
+    kern_return_t code = dm_vm_reserve(owner.length, &reservation);
+    result[@"allocation_api"] = @"vm_allocate_then_vm_protect_none"; result[@"allocation_code"] = @(code);
+    result[@"reservation_bytes"] = @(owner.length);
+    if (code != KERN_SUCCESS) { result[@"status"] = @"error"; result[@"stage"] = @"reserve"; return result; }
+    owner.pointer = reservation;
+    size_t page = vm_page_size, opened = 8 * page;
+    uint8_t *openBase = (uint8_t *)reservation + 2 * page;
+    if (probe_vm_change(openBase, opened, PROT_READ | PROT_WRITE, 0))
+        return failed(@"open_reserved_range", [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil]);
+    memset(openBase, 0xCD, opened);
+    uint8_t *pool = openBase + 4096; size_t requested = page + 4096;
+    dm_vm_pool_region region;
+    code = dm_vm_pool_check(pool, requested, &region);
+    result[@"region_code"] = @(code); result[@"opened_bytes"] = @(opened); result[@"pool_requested_bytes"] = @(requested);
+    if (code != KERN_SUCCESS) { result[@"status"] = @"error"; result[@"stage"] = @"pool_region"; return result; }
+    result[@"rounded_bytes"] = @(region.length); result[@"offset_bytes"] = @((uintptr_t)pool - region.base);
+    result[@"region_bytes"] = @(region.region_length); result[@"region_shared"] = @(region.shared);
+    result[@"protection"] = @(region.protection); result[@"maximum_protection"] = @(region.maximum_protection);
+    result[@"max_buffer_length"] = @(device.maxBufferLength);
+    if (region.length > device.maxBufferLength) { result[@"status"] = @"unsupported"; result[@"stage"] = @"max_buffer_length"; return result; }
+    uint64_t lease;
+    code = dm_vm_lease_acquire(&g_probe_leases, region.base, region.length, &lease);
+    if (code != KERN_SUCCESS) { result[@"status"] = @"error"; result[@"stage"] = @"pool_lease"; return result; }
+    owner->pool_lease = lease;
+    result[@"status"] = @"pending"; result[@"stage"] = @"wrap_protected_pool";
+    if (!publish(result)) return failed(@"result_persistence", nil);
+    id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:(void *)region.base length:region.length options:MTLResourceStorageModeShared
+        deallocator:^(void *memory, NSUInteger length) {
+            (void)memory; (void)length; (void)owner.length;
+            dm_vm_lease_retire(&owner->pool_lease, probe_lease_release);
+        }];
+    if (!nvn_buffer_identity(buffer, (void *)region.base, region.length, device))
+        return failed(@"wrapped_pool_identity", nil);
+    for (unsigned i = 0; i < DM_GPU_PROBE_WORDS; i++) ((uint32_t *)pool)[i] = i + 1;
+    id<MTLSharedEvent> gate = [device newSharedEvent];
+    if (!gate || gate.signaledValue) return failed(@"gpu_hold_event", nil);
+    __block BOOL liveRejected = NO, unchanged = NO, persisted = YES;
+    NSDictionary *computed;
+    @autoreleasepool {
+        computed = compute_at(device, queue, NO, buffer, (const uint32_t *)pool, owner,
+            (uintptr_t)pool - region.base, gate, ^(id<MTLCommandBuffer> command) {
+                int status = (int)command.status;
+                int changed = probe_vm_change((void *)region.base, region.length, PROT_NONE, 1);
+                liveRejected = status != MTLCommandBufferStatusCompleted && status != MTLCommandBufferStatusError && changed == -1 && errno == EBUSY;
+                dm_vm_pool_region checked;
+                unchanged = dm_vm_pool_check(pool, requested, &checked) == KERN_SUCCESS && ((const uint32_t *)pool)[0] == 1;
+                result[@"submitted_command_status"] = @(status); result[@"live_discard_rejected"] = @(liveRejected);
+                result[@"live_region_unchanged"] = @(unchanged); result[@"stage"] = @"gpu_waiting_on_owned_event";
+                persisted = publish(result);
+                gate.signaledValue = 1;
+            });
+    }
+    [result addEntriesFromDictionary:computed];
+    if (![computed[@"command_completed"] boolValue]) return result;
+    BOOL guards = YES;
+    for (size_t i = 0; i < opened; i++) if ((i < 4096 || i >= 4096 + DM_GPU_PROBE_WORDS * sizeof(uint32_t)) && openBase[i] != 0xCD) { guards = NO; break; }
+    id<MTLBuffer> debugReference = buffer;
+    BOOL stillRejected = probe_vm_change((void *)region.base, region.length, PROT_NONE, 1) == -1 && errno == EBUSY;
+    result[@"post_gpu_live_buffer_discard_rejected"] = @(stillRejected);
+    result[@"held_buffer_bytes"] = @(debugReference.length);
+    buffer = nil; debugReference = nil;
+    NSTimeInterval until = NSProcessInfo.processInfo.systemUptime + 5;
+    while (probe_lease_count() && NSProcessInfo.processInfo.systemUptime < until) usleep(1000);
+    BOOL retired = probe_lease_count() == 0;
+    BOOL unmapped = retired && probe_vm_change((void *)region.base, region.length, PROT_NONE, 1) == 0;
+    result[@"surrounding_bytes_unchanged"] = @(guards); result[@"actual_deallocator_observed"] = @(retired);
+    result[@"post_deallocator_unmap_accepted"] = @(unmapped);
+    if (!retired) { result[@"status"] = @"timeout"; result[@"stage"] = @"buffer_deallocator"; }
+    else if (!liveRejected || !unchanged || !persisted || !guards || !stillRejected || !unmapped) { result[@"status"] = @"error"; result[@"stage"] = @"pool_lifetime_contract"; }
     return result;
 }
 
@@ -282,13 +393,14 @@ int dm_gpu_probe(void) {
                 else { [set addAllocation:shared]; [set commit]; [queue addResidencySet:set]; [queue removeResidencySet:set]; tests[@"residency_set"] = @{@"status": @"passed", @"queue_registration": @YES}; }
             }
         }
-        const enum dm_gpu_probe_case cases[] = {DM_GPU_CASE_VM, DM_GPU_CASE_SHARED, DM_GPU_CASE_ALIAS, DM_GPU_CASE_MALLOC};
-        NSString *names[] = {@"nocopy_vm", @"nocopy_shared", @"buffer_alias", @"nocopy_malloc"};
-        for (int i = 0; i < 4; i++) if (selection == cases[i] || selection == DM_GPU_CASE_ALL) {
+        const enum dm_gpu_probe_case cases[] = {DM_GPU_CASE_VM, DM_GPU_CASE_SHARED, DM_GPU_CASE_ALIAS, DM_GPU_CASE_POOL, DM_GPU_CASE_MALLOC};
+        NSString *names[] = {@"nocopy_vm", @"nocopy_shared", @"buffer_alias", @"protected_pool", @"nocopy_malloc"};
+        for (int i = 0; i < 5; i++) if (selection == cases[i] || selection == DM_GPU_CASE_ALL) {
             if (!begin_test(result, path, names[i])) return 1;
             NSString *name = names[i];
             BOOL (^publish)(NSDictionary *) = ^BOOL(NSDictionary *detail) { tests[name] = detail; return write_report(result, path, NO); };
-            tests[name] = cases[i] == DM_GPU_CASE_ALIAS ? buffer_alias(device, queue, publish)
+            tests[name] = cases[i] == DM_GPU_CASE_POOL ? protected_pool(device, queue, publish)
+                : cases[i] == DM_GPU_CASE_ALIAS ? buffer_alias(device, queue, publish)
                 : no_copy(device, queue, cases[i] == DM_GPU_CASE_VM ? BackingVM : cases[i] == DM_GPU_CASE_SHARED ? BackingShared : BackingMalloc, publish);
         }
         [result removeObjectForKey:@"pending_test"]; result[@"complete"] = @YES; result[@"loaded_metal_images"] = metal_images();

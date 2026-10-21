@@ -4,6 +4,9 @@
 // Register convention: inputs w1.. / outputs w0=Result, x1=value (GetInfo / SetHeapSize), consistent with the public Horizon ABI.
 #include "dm.h"
 #include "hle.h"
+#include "dm_vm.h"
+#include "dm_vm_leases.h"
+#include "../gfx/nvn/nvn_simulator.h"
 #include <stdatomic.h>
 #include <sys/mman.h>
 #include <errno.h>
@@ -35,9 +38,16 @@ static void mem_init(void) {
     // Step down from 5120 MiB (128 MiB per step), floor 4864 MiB (heap capacity = reserve − 1 GB ≥ 3728 MB + margin)
     const size_t start = 5ull << 30, step = 128ull << 20, limit = 4864ull << 20;
     for (size_t sz = start; sz >= limit; sz -= step) {
+#if DM_NVN_SIMULATOR
+        void *memory = NULL;
+        kern_return_t code = dm_vm_reserve(sz, &memory);
+        if (code == KERN_SUCCESS) { g_as = memory; g_reserve = sz; break; }
+        LOG("Simulator reserve %zu MiB failed: kern_return=%d", sz >> 20, code);
+#else
         g_as = mmap(NULL, sz, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (g_as != MAP_FAILED) { g_reserve = sz; break; }
         int err = errno; LOG("【红】reserve %zu MiB: mmap 失败 errno=%d (%s)，降档重试", sz >> 20, err, strerror(err));
+#endif
         if (sz == limit) die("reserve guest AS: 试过 %zu–%zu MiB，全部失败", limit >> 20, start >> 20);
     }
     // 固定划分（都在预留块内）：alias 512MB、stack 256MB、heap 其余从 2GB 处起
@@ -46,6 +56,42 @@ static void mem_init(void) {
     g_stack = g_as + 0x30000000; g_stack_cap = 0x10000000;
     g_heap  = g_as + 0x40000000; g_heap_cap  = g_reserve - 0x40000000;
     LOG("guest AS %p +%zu MiB（降档后实际预留 %zu MiB）  heap %p alias %p stack %p", g_as, g_reserve >> 20, g_reserve >> 20, g_heap, g_alias, g_stack);
+}
+
+#if DM_NVN_SIMULATOR
+static pthread_mutex_t g_vm_lock = PTHREAD_MUTEX_INITIALIZER;
+static dm_vm_pool_leases g_vm_leases = {.next = 1};
+kern_return_t dm_guest_vm_pool_acquire(const void *memory, uint64_t length, dm_vm_pool_region *region, uint64_t *lease) {
+    pthread_mutex_lock(&g_vm_lock);
+    kern_return_t code = dm_vm_pool_check(memory, length, region);
+    if (code == KERN_SUCCESS) {
+        uint64_t base = (uint64_t)(uintptr_t)g_as, address = region->base;
+        if (!g_as || address < base || address - base > g_reserve || region->length > g_reserve - (address - base))
+            code = KERN_INVALID_ADDRESS;
+        else code = dm_vm_lease_acquire(&g_vm_leases, region->base, region->length, lease);
+    }
+    pthread_mutex_unlock(&g_vm_lock);
+    return code;
+}
+void dm_guest_vm_pool_release(uint64_t lease) {
+    pthread_mutex_lock(&g_vm_lock);
+    kern_return_t code = dm_vm_lease_release(&g_vm_leases, lease);
+    pthread_mutex_unlock(&g_vm_lock);
+    if (code != KERN_SUCCESS) die("Simulator pool lease release failed: %d", code);
+}
+#endif
+
+static int guest_vm_change(void *memory, size_t length, int protection, int discard) {
+#if DM_NVN_SIMULATOR
+    pthread_mutex_lock(&g_vm_lock);
+    int result = dm_vm_change(&g_vm_leases, memory, length, protection, discard);
+    int error = errno;
+    pthread_mutex_unlock(&g_vm_lock);
+    errno = error; return result;
+#else
+    if (discard) madvise(memory, length, MADV_FREE);
+    return mprotect(memory, length, protection);
+#endif
 }
 
 // 应用内存池 = Switch（4 GB 机型）给应用的 3285 MB。游戏启动（main+0x1b66160）把 QueryMemoryInfo 报的总量整块设成堆、失败就减 2 MB 重试，
@@ -140,8 +186,9 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         if (size > g_heap_cap) { LOG("SetHeapSize OOM: req %#zx > cap %#zx", size, g_heap_cap); regs[0] = 0xD401; return 0; }
         if (size + image_bytes() > app_pool()) { g_heap_rejects++; regs[0] = 0x10801; return 0; }   // 超出应用内存池：ResultLimitReached。游戏启动时按 2 MB 递减重试直到放得下（main+0x1b66184） | exceeds the application memory pool: ResultLimitReached. At startup the game retries in 2 MB decrements until it fits (main+0x1b66184)
         int rc = 0;
-        if (size > g_heap_cur) rc = mprotect(g_heap + g_heap_cur, size - g_heap_cur, PROT_READ | PROT_WRITE);
-        else if (size < g_heap_cur) rc = mprotect(g_heap + size, g_heap_cur - size, PROT_NONE);
+        if (size > g_heap_cur) rc = guest_vm_change(g_heap + g_heap_cur, size - g_heap_cur, PROT_READ | PROT_WRITE, 0);
+        else if (size < g_heap_cur) rc = guest_vm_change(g_heap + size, g_heap_cur - size, PROT_NONE, 0);
+        if (DM_NVN_SIMULATOR && rc) die("Simulator SetHeapSize protection failed: errno=%d", errno);
         if (g_flag.svc) LOG("SetHeapSize %#zx -> base %p mprotect=%d errno=%d", size, g_heap, rc, errno);
         { static int said; if (!said && size) { said = 1; LOG("SetHeapSize：首次设堆成功 %zu MB（应用内存池 %llu MB − 映像 %zu MB；此前被拒 %d 次）", size >> 20, (unsigned long long)(app_pool() >> 20), image_bytes() >> 20, g_heap_rejects); } }
         g_heap_cur = size;
@@ -156,7 +203,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // 苹果页 16K、Horizon 页 4K：可访问区扩到 16K 边界（多放开的是同区未用页，不影响语义）
         // Apple pages are 16K, Horizon pages 4K: the accessible region is extended to a 16K boundary (the extra pages opened are unused pages of the same region, semantics unaffected)
         uint64_t lo = dst & ~0x3FFFull, hi = (dst + size + 0x3FFF) & ~0x3FFFull;
-        if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE)) die("MapMemory mprotect errno=%d", errno);
+        if (guest_vm_change((void *)lo, hi - lo, PROT_READ | PROT_WRITE, 0)) die("MapMemory mprotect errno=%d", errno);
         memcpy((void *)dst, (void *)src, size);   // 搬移语义：映射期间源区不被访问（Horizon 把它设为不可访问） | move semantics: the source region is not accessed while mapped (Horizon makes it inaccessible)
         map_add(dst, size, src, 0x0B /*MappedMemory*/);
         if (g_flag.svc) LOG("MapMemory %#llx <- %#llx +%#llx", dst, src, size);
@@ -207,8 +254,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
     case 0x2C: case 0x2D: {  // MapPhysicalMemory / UnmapPhysicalMemory(addr, size)：只许在 alias 区内（SDK 的 VammManager 用） | MapPhysicalMemory / UnmapPhysicalMemory(addr, size): only allowed inside the alias region (used by the SDK's VammManager)
         uint8_t *a = (uint8_t *)regs[0]; size_t size = regs[1];
         if (a < g_alias || a + size > g_alias + g_alias_cap) { LOG("SVC %#x 越出 alias 区 %p+%#zx", num, a, size); regs[0] = 0xD401; return 0; }
-        int rc = num == 0x2C ? mprotect(a, size, PROT_READ | PROT_WRITE)
-                             : (madvise(a, size, MADV_FREE), mprotect(a, size, PROT_NONE));
+        int rc = guest_vm_change(a, size, num == 0x2C ? PROT_READ | PROT_WRITE : PROT_NONE, num == 0x2D);
         if (rc) die("SVC %#x mprotect %p+%#zx errno=%d", num, a, size, errno);
         if (g_flag.svc) LOG("%sPhysicalMemory %p+%#zx", num == 0x2C ? "Map" : "Unmap", a, size);
         regs[0] = 0; return 0;

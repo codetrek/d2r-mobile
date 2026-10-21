@@ -17,6 +17,7 @@
 #include "nvn_copy_pitch.h"
 #include "nvn_simulator.h"
 #include "nvn_buffer_map.h"
+#include "nvn_buffer_identity.h"
 #include "nvn_native_arguments.h"
 // 编译期开关 DM_NVN_M3=1：图形后端走老接口（普通命令队列 / 命令缓冲 / 渲染与计算与拷贝编码器，逐槽绑定缓冲，对参数块引用的资源逐个声明），
 // 目标 macOS 15 / iOS 18。缺省 0 = Metal 4（macOS 26 / iOS 26）。两支共用同一份回放逻辑，分叉处都在 #if DM_NVN_M3 里
@@ -73,6 +74,7 @@
 #endif
 #include "nvn_hmap.h"
 #include "../../host/dm.h"
+#include "../../host/dm_vm.h"
 #import <CommonCrypto/CommonDigest.h>
 #include <stdarg.h>
 #include <mach-o/dyld.h>
@@ -153,6 +155,10 @@ static int g_res_dirty;
 static id<MTLSharedEvent> g_ev;
 static uint64_t g_fence;                        // 已提交的最大栅栏值（提交线程独占递增） | Highest committed fence value (incremented exclusively by the submit thread)
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+#if DM_NVN_SIMULATOR
+static int g_sim_sub_active;
+static _Atomic uint64_t g_sim_planned_fence;
+#endif
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_done;                         // 已完成的最大栅栏值（完成回调写） | Highest completed fence value (written by the completion callback)
 static _Atomic int g_last_commit_error;
@@ -283,6 +289,16 @@ static void res_commit(void) {
     pthread_mutex_unlock(&g_res_mu);
 }
 
+#if DM_NVN_SIMULATOR
+@interface NvPoolLease : NSObject { @public _Atomic uint64_t lease; }
+- (void)retire;
+@end
+@implementation NvPoolLease
+- (void)retire { dm_vm_lease_retire(&lease, dm_guest_vm_pool_release); }
+- (void)dealloc { [self retire]; }
+@end
+#endif
+
 @interface NvDeferredRelease : NSObject { @public id object; uint64_t fence; int keep_resident; } @end
 @implementation NvDeferredRelease @end
 static NSMutableArray<NvDeferredRelease *> *g_deferred;
@@ -297,22 +313,29 @@ static pthread_mutex_t g_deferred_mu = PTHREAD_MUTEX_INITIALIZER;
 //   defer_obj_unref   = only the reference I hold is no longer wanted, the object itself may still be in use (the view cache of a texture ID may hold the base texture itself): only drop the reference, leave the residency set alone.
 // Previously only the former existed: when the view cache was invalidated, a texture that 'is still the current storage of some serial' was also removed from the residency set. Invalidation used to happen only when the base texture was really replaced, so it was never hit;
 // after the transparency chain's in-place composite swapped the storage of two textures, each of the two live textures was removed once this way, and afterwards they are used as attachments and sampled every frame as usual - the GPU accesses non-resident memory.
-static void defer_obj_release_ex(id obj, int keep_resident) {
+static void defer_obj_release_at(id obj, int keep_resident, uint64_t fence) {
     if (!obj) return;
-    NvDeferredRelease *d = [NvDeferredRelease new]; d->object = obj; d->fence = g_fence + 1; d->keep_resident = keep_resident;
+    NvDeferredRelease *d = [NvDeferredRelease new]; d->object = obj; d->fence = fence; d->keep_resident = keep_resident;
     pthread_mutex_lock(&g_deferred_mu);
     if (!g_deferred) g_deferred = [NSMutableArray array];
     [g_deferred addObject:d];
     pthread_mutex_unlock(&g_deferred_mu);
 }
+static void defer_obj_release_ex(id obj, int keep_resident) {
+#if DM_NVN_SIMULATOR
+    defer_obj_release_at(obj, keep_resident, atomic_load(&g_sim_planned_fence));
+#else
+    defer_obj_release_at(obj, keep_resident, g_fence + 1);
+#endif
+}
 static void defer_obj_release(id obj) { defer_obj_release_ex(obj, 0); }
 static void defer_obj_unref(id obj) { defer_obj_release_ex(obj, 1); }
-static void defer_drain(void) {
+static void defer_drain_to(uint64_t completed) {
     NSMutableArray<NvDeferredRelease *> *ready = [NSMutableArray array];
     pthread_mutex_lock(&g_deferred_mu);
     for (NSInteger i = g_deferred.count - 1; i >= 0; i--) {
         NvDeferredRelease *d = g_deferred[(NSUInteger)i];
-        if (d->fence <= g_done) { [ready addObject:d]; [g_deferred removeObjectAtIndex:(NSUInteger)i]; }
+        if (d->fence <= completed) { [ready addObject:d]; [g_deferred removeObjectAtIndex:(NSUInteger)i]; }
     }
     pthread_mutex_unlock(&g_deferred_mu);
     for (NvDeferredRelease *d in ready) {
@@ -323,9 +346,11 @@ static void defer_drain(void) {
             pthread_mutex_unlock(&g_res_mu);
             if (registered) res_remove((id<MTLResource>)obj);
         }
+
         d->object = nil;
     }
 }
+static void defer_drain(void) { defer_drain_to(g_done); }
 
 static pthread_mutex_t g_bf_want_mu = PTHREAD_MUTEX_INITIALIZER;
 static char **g_bf_want_keys; static size_t g_bf_want_n, g_bf_want_cap; static int g_bf_want_loaded;
@@ -350,6 +375,8 @@ void bf_want_note(const char *key) {
 
 // ---------- 内存池 ----------
 // ---------- Memory pools ----------
+
+
 typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; } pool_ent;   // res：已放进驻留集（按需，见 pool_res） | res: already put in the residency set (on demand, see pool_res)
 static pool_ent *g_pools; static int g_npool, g_cap;
 static NSMutableArray *g_keep;                  // 持有缓冲引用（pool_ent 里是不持有的指针） | Holds the buffer references (pool_ent has non-owning pointers)
@@ -518,8 +545,26 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     mtl_init(); g_reg_gen++;
     uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)mem, hi = lo + size;
     uintptr_t a = lo & ~(pg - 1), b = (hi + pg - 1) & ~(pg - 1);
+#if DM_NVN_SIMULATOR
+    dm_vm_pool_region region; uint64_t lease;
+    kern_return_t code = dm_guest_vm_pool_acquire(mem, size, &region, &lease);
+    if (code != KERN_SUCCESS) MDIE("Simulator pool region/AS ownership invalid: bytes=%llu kern_return=%d", (unsigned long long)size, code);
+    if (region.length > g_dev.maxBufferLength) { dm_guest_vm_pool_release(lease); MDIE("Simulator pool exceeds device maxBufferLength: %llu > %lu", (unsigned long long)region.length, (unsigned long)g_dev.maxBufferLength); }
+    a = region.base; b = a + region.length;
+#endif
+#if DM_NVN_SIMULATOR
+    // Apple's deallocator is the release boundary for caller-owned no-copy pages:
+    // https://developer.apple.com/documentation/metal/mtldevice/makebuffer(bytesnocopy:length:options:deallocator:)
+    NvPoolLease *owner = [NvPoolLease new]; owner->lease = lease;
+    id<MTLBuffer> buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a options:MTLResourceStorageModeShared
+        deallocator:^(void *pointer, NSUInteger length) { (void)pointer; (void)length; [owner retire]; }];
+    if (!buf) { [owner retire]; MDIE("Simulator no-copy pool buffer creation failed"); }
+    if (!nvn_buffer_identity(buf, (void *)a, b - a, g_dev)) MDIE("Simulator no-copy pool did not preserve its owned pages/device");
+    MLOG("Simulator pool validated: requested=%llu rounded=%llu offset=%llu region=%llu protection=%u shared=%d", (unsigned long long)size, (unsigned long long)(b - a), (unsigned long long)(lo - a), (unsigned long long)region.region_length, region.protection, region.shared);
+#else
     id<MTLBuffer> buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a options:MTLResourceStorageModeShared deallocator:nil];
     if (!buf) MDIE("内存池 %p+%#llx 建零拷贝缓冲失败", mem, (unsigned long long)size);
+#endif
     pthread_mutex_lock(&g_mu);
     if (g_npool == g_cap) { g_cap = g_cap ? g_cap * 2 : 64; g_pools = realloc(g_pools, g_cap * sizeof *g_pools); }
     g_pools[g_npool++] = (pool_ent){lo, hi, a, buf, buffer_address(buf), mem, 0};   // 先不进驻留集：第一次被取址时才放进去（pool_res） | not in the residency set yet: put in the first time it is addressed (pool_res)
@@ -531,11 +576,39 @@ void mtl_pool_add(const void *mem, uint64_t size) {
 void mtl_pool_del(const void *mem) {
     g_reg_gen++;
     id<MTLBuffer> gone = nil;
+#if DM_NVN_SIMULATOR
+    int resolved = 0, active; uint64_t retire_fence;
+#endif
     pthread_mutex_lock(&g_mu);
-    for (int i = 0; i < g_npool; i++)
-        if (g_pools[i].key == mem) { gone = g_pools[i].buf; [g_keep removeObject:gone]; g_pools[i] = g_pools[--g_npool]; break; }
+#if DM_NVN_SIMULATOR
+    active = g_sim_sub_active; retire_fence = active ? g_sim_planned_fence : g_fence;
+#endif
+    for (int i = 0; i < g_npool; i++) if (g_pools[i].key == mem) {
+        gone = g_pools[i].buf;
+#if DM_NVN_SIMULATOR
+        resolved = g_pools[i].res;
+#endif
+        [g_keep removeObject:gone]; g_pools[i] = g_pools[--g_npool]; break;
+    }
     pthread_mutex_unlock(&g_mu);
-    defer_obj_release(gone);   // 退役：等用过它的提交完成后放掉，并移出驻留集（原先只从 g_keep 摘掉——驻留集强持有它，零拷贝缓冲对象永远不销毁） | retire: release after the submissions that used it complete, and remove from the residency set (it used to be only removed from g_keep - the residency set holds it strongly, so the zero-copy buffer object was never destroyed)
+#if DM_NVN_SIMULATOR
+    if (gone && resolved && active) {
+        defer_obj_release_at(gone, 0, retire_fence);
+        defer_drain();
+        return;
+    }
+    if (gone) {
+        // Drop backend-owned references at completed work, without inventing a
+        // future frame. Actual API references still keep the no-copy lease alive
+        // until its deallocator runs; completion alone never frees these pages.
+        if (resolved) { if (retire_fence) mtl_wait(retire_fence, UINT64_MAX); while (atomic_load(&g_up_pending)) usleep(200); }
+        defer_drain();
+        res_remove(gone);
+        gone = nil;
+    }
+#else
+    defer_obj_release(gone);
+#endif
 }
 
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
@@ -648,11 +721,17 @@ void mtl_sub_begin(void) {
     defer_reset();
     warm_claim();
     if (g_cb) MDIE("提交重入");
+#if DM_NVN_SIMULATOR
+    pthread_mutex_lock(&g_mu); g_sim_sub_active = 1; g_sim_planned_fence = g_fence + 1; pthread_mutex_unlock(&g_mu);
+#endif
     g_sub_thread = pthread_self(); atomic_store(&g_sub_thread_set, 1);
     atomic_store(&g_last_commit_error, 0);
     g_sub_pool = objc_autoreleasePoolPush();
 #if DM_NVN_M3
     g_cb = [g_q commandBuffer];
+#if DM_NVN_SIMULATOR
+    if (![g_cb retainedReferences]) MDIE("Simulator command buffer must retain its resources");
+#endif
 #else
     g_cb = [g_dev newCommandBuffer];
 #endif
@@ -957,8 +1036,13 @@ uint64_t mtl_sub_commit(void) {
             else { uint64_t t = gpu_ticks(), rec[2] = {ops[i].type == 0 || ops[i].type == 0x10 ? t : 0, t}; memcpy((void *)ops[i].addr, rec, sizeof rec); }
         }
         free(ops);
+#if DM_NVN_SIMULATOR
+        defer_drain_to(fence);
+#endif
         pthread_mutex_lock(&g_mu); if (fence > g_done) g_done = fence; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+#if !DM_NVN_SIMULATOR
         defer_drain();
+#endif
     }];
     pg_commit(FB_ON(o, g_cb));   // 逐通道 GPU 计时（DM_NVN_PASSGPU）：没开时直接返回 | Per-pass GPU timing (DM_NVN_PASSGPU): returns immediately when off
     void arena_commit(uint64_t fence); arena_commit(fence);
@@ -975,6 +1059,9 @@ uint64_t mtl_sub_commit(void) {
     cb_committed();
     g_alloc_fence[g_alloc_cur] = fence;
     g_cb = nil;
+#if DM_NVN_SIMULATOR
+    pthread_mutex_lock(&g_mu); g_sim_sub_active = 0; pthread_mutex_unlock(&g_mu);
+#endif
     g_commit_blocks = nil;
     objc_autoreleasePoolPop(g_sub_pool); g_sub_pool = NULL;
     return fence;
@@ -992,6 +1079,9 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     while (g_done < fence) if ((r = pthread_cond_timedwait(&g_cv, &g_mu, &dl))) break;
     int ok = g_done >= fence;
     pthread_mutex_unlock(&g_mu);
+#if DM_NVN_SIMULATOR
+    if (ok) defer_drain();
+#endif
     return ok;
 }
 
