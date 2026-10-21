@@ -18,6 +18,7 @@ import sys
 import time
 
 from shaders import PROFILE, sha, stage
+from inputs import validate_donor
 
 IOS = Path(__file__).resolve().parents[2]
 DM = IOS.parent
@@ -162,6 +163,7 @@ def build(args):
     product = dict(line.split('=', 1) for line in (app / 'dm/shell_info.txt').read_text().splitlines() if '=' in line)
     if product['PRODUCT'] != (DM / 'PRODUCT').read_text().strip():
         raise ValueError('derived app resources and source PRODUCT differ')
+    donor_proof = validate_donor(app, args.modules)
     source_inputs = {str(p): sha(p) for p in [args.shader_manifest, *(args.tables / n for n in
                     ('dm_hud_exp.h', 'dm_vault_tab.h', 'dm_bright_levels.inc')),
                     *(args.modules / (m + suffix) for m in ('main', 'sdk') for suffix in
@@ -179,6 +181,10 @@ def build(args):
             shutil.copyfile(path, dst)
             source_inputs[str(path)] = sha(path)
     metadata = args.shader_metadata
+    for module_name in ('main', 'sdk'):
+        for suffix in ('.fixups.tsv', '.gates.tsv'):
+            name = module_name + suffix
+            shutil.copyfile(args.modules / name, root / 'resources/dm' / name)
     expected = {line.split('\t')[3] for line in (metadata / 'shader_map.tsv').read_text().splitlines()
                 if line and not line.startswith(('#', 'package\t'))}
     fetch = module('simulator_dmsh_fetch', DM / 'gfx/tools/dmsh_fetch.py')
@@ -231,7 +237,7 @@ def build(args):
                     source_diff_sha256=hashlib.sha256(subprocess.check_output(['git', '-C', REPO, 'diff', '--binary'])).hexdigest(),
                     source_inputs=source_inputs, app=str(result), app_identity=app_proof,
                     generated_guest_identity=framework_proof, guest_identity=signed_guest_proof,
-                    shaders=shader_proof, native_art=art_proof,
+                    shaders=shader_proof, native_art=art_proof, donor=donor_proof,
                     simulator_device_created=False, guest_executed=False)
     (root / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(json.dumps(dict(app=str(result), profile=PROFILE, state='built_unexecuted')), flush=True)

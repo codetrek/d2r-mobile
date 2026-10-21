@@ -17,7 +17,7 @@ D2R Mobile 的 iOS App：把宿主（`dm/host`）、图形层（`dm/gfx`）和�
 
 `main` 跟进上游；服务端集成和模拟器改动放在 `with-server`。独立的 `DmIOSSimulator` 构建工具生成 ARM64 iPhoneSimulator 应用、全新的 platform7 Guest.framework，并显式选择 Metal3 后端及经过核对的 MSL 源码着色器链。设备生成继续默认使用 platform2。私人输入和生成应用留在仓库 `.tmp`。
 
-当前私人应用构建和模拟器线程本地存储检查已经通过；进入世界、保存退出和两个客户端共享世界仍未完成验证。构建清单的两项来源校验正在修正，完整命令、输入和结果边界见[模拟器工具说明](tools/simulator/README.md)。
+当前私人应用构建和模拟器线程本地存储检查已经通过；进入世界、保存退出和两个客户端共享世界仍未完成验证。工具已强制核对 donor Guest 的模块字节及四份 fixup/gate 表，并统一从选定模块输入暂存运行表；完整源码与资源冻结仍待补齐。完整命令、输入和结果边界见[模拟器工具说明](tools/simulator/README.md)。
 
 ## 怎么工作
 
@@ -288,5 +288,5 @@ make -C dm/ios/tests test
 | `lifecycle.sh` | 真机上切后台再回前台的一轮生命周期测试 |
 | `screen_check.py`、`fullscreen_check.py` | 按整窗截图核对方向、黑边、拉伸 |
 | `bootprof.sh`、`heat_ab.sh`、`gpu_read.sh`、`xtrace.sh` | 真机测量：启动时间线、发热对照、GPU 时间、Instruments 命令行录制 |
-| `simulator/build.py`、`simulator/shaders.py` | 独立 ARM64 模拟器应用与严格的 MSL 源码缓存检查，详见[说明](tools/simulator/README.md) |
+| `simulator/build.py`、`simulator/shaders.py`、`simulator/inputs.py` | 独立 ARM64 模拟器应用与严格的 MSL 源码缓存检查，详见[说明](tools/simulator/README.md) |
 | `asset_manifest.py` | 给资源直接下载通路生成清单 |

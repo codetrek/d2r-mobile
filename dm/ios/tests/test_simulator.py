@@ -16,6 +16,7 @@ REPO = IOS.parent.parent
 sys.path.insert(0, str(IOS / 'tools/simulator'))
 import shaders
 import build as simulator_build
+import inputs as simulator_inputs
 
 
 def load(name, path):
@@ -82,6 +83,59 @@ class Contracts(unittest.TestCase):
             path.write_bytes(truncated)
             with self.assertRaises(ValueError):
                 simulator_build.inspect_platform(path, 6)
+
+    def donor(self):
+        self.modules()
+        (self.root / 'sdk.fixups.tsv').write_text('# TEXT_END 100\n# PATCH_OFF 8000\n')
+        (self.root / 'sdk.patched.bin').write_bytes(b'\xa7' * 0x8200)
+        app = self.root / 'donor.app'
+        (app / 'dm').mkdir(parents=True)
+        for name in ('main', 'sdk'):
+            (self.root / (name + '.gates.tsv')).write_text('synthetic-' + name + '\n')
+            for suffix in ('.fixups.tsv', '.gates.tsv'):
+                (app / 'dm' / (name + suffix)).write_bytes((self.root / (name + suffix)).read_bytes())
+        guest.write(self.root, app / 'Frameworks', ['main', 'sdk'])
+        return app
+
+    def test_donor_module_and_metadata_binding(self):
+        app = self.donor()
+        proof = simulator_inputs.validate_donor(app, self.root)
+        self.assertTrue(proof['section_bytes_matched'])
+        self.assertEqual(set(proof['metadata']), {'main.fixups.tsv', 'main.gates.tsv', 'sdk.fixups.tsv', 'sdk.gates.tsv'})
+        self.assertEqual(proof['modules']['main'], shaders.sha(self.root / 'main.patched.bin'))
+        for name in proof['metadata']:
+            with self.subTest(name=name):
+                path = app / 'dm' / name
+                original = path.read_bytes()
+                path.write_bytes(original + b'changed\n')
+                with self.assertRaisesRegex(ValueError, 'metadata mismatch'):
+                    simulator_inputs.validate_donor(app, self.root)
+                path.write_bytes(original)
+
+    def test_donor_guest_and_selected_module_bytes_must_match(self):
+        app = self.donor()
+        path = self.root / 'main.patched.bin'
+        original = path.read_bytes()
+        path.write_bytes(b'changed' + original[7:])
+        with self.assertRaisesRegex(ValueError, 'module bytes mismatch'):
+            simulator_inputs.validate_donor(app, self.root)
+        path.write_bytes(original)
+        donor = app / 'Frameworks/Guest.framework/Guest'
+        raw = bytearray(donor.read_bytes())
+        raw[0x4000] ^= 1
+        donor.write_bytes(raw)
+        with self.assertRaisesRegex(ValueError, 'module bytes mismatch'):
+            simulator_inputs.validate_donor(app, self.root)
+
+    def test_donor_container_bounds(self):
+        app = self.donor()
+        path = app / 'Frameworks/Guest.framework/Guest'
+        raw = path.read_bytes()
+        for malformed in (raw[:16], raw[:64], raw[:16] + struct.pack('<I', 1025) + raw[20:]):
+            with self.subTest(size=len(malformed)):
+                path.write_bytes(malformed)
+                with self.assertRaises(ValueError):
+                    simulator_inputs.validate_donor(app, self.root)
 
     def cache(self):
         self.key = 'a' * 16
