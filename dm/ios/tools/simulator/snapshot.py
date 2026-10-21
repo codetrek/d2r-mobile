@@ -116,7 +116,7 @@ def package_resources(source, destination, resources, generated_files):
 
 def source(repo, destination):
     repo = Path(repo)
-    scopes = ['dm/host', 'dm/gfx', 'dm/ios', 'dm/tvos', 'dm/tools', 'dm/third_party/libdeflate', 'dm/PRODUCT']
+    scopes = ['dm']
     names = subprocess.check_output(['git', '-C', repo, 'ls-files', '--cached', '--others',
                                      '--exclude-standard', '-z', *scopes]).split(b'\0')
     names = sorted({os.fsdecode(name) for name in names if name})

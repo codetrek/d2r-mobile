@@ -225,7 +225,7 @@ class Contracts(unittest.TestCase):
         proof = snapshot.source(REPO, self.root / 'source')
         self.assertTrue(proof['includes_untracked_inputs'])
         for name in ('dm/host/loader.c', 'dm/tools/guest_dylib.py', 'dm/ios/tools/simulator/build.py',
-                     'dm/ios/tools/simulator/snapshot.py'):
+                     'dm/ios/tools/simulator/snapshot.py', 'dm/third_party/bcdec/bcdec.h'):
             self.assertEqual(proof['files'][name]['sha256'], shaders.sha(REPO / name))
         snapshot.verify(self.root / 'source', proof, originals=True)
 
