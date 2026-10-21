@@ -43,6 +43,7 @@ t_joy_travel: t_joy_travel.c ../Sources/dm_touch_controls.c ../Sources/dm_touch_
 t_metal_cache_guard: t_metal_cache_guard.c ../Sources/dm_metal_cache_guard.c ../Sources/dm_metal_cache_guard.h
 	$(CC) $(CFLAGS) -I../Sources t_metal_cache_guard.c ../Sources/dm_metal_cache_guard.c -o $@
 test: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET)
+	python3 test_simulator.py
 	./$(METAL_CACHE_TARGET)
 	./$(TARGET)
 	./t_skill_aim

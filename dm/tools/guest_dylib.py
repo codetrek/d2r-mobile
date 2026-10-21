@@ -28,10 +28,29 @@
 # · __LINKEDIT goes last and ends with a reserved code-signature area holding a linker-signed ad-hoc signature (CS_LINKER_SIGNED, the same kind ld writes) with room to spare, so a re-signing tool can write its signature in place;
 # zsign (LiveContainer and other on-device signers) cannot add a signature command to this file, because it only finds free header space via a section named __text, which Guest does not have.
 # Usage: guest_dylib.py <build output directory> <output directory> <module name...>     writes <output directory>/Guest.framework/{Guest,Info.plist}
-import hashlib, os, struct, sys
+import argparse, hashlib, os, plistlib, struct
+from enum import Enum
 
 PG = 0x4000
 MIN_IOS = 26 << 16   # 与工程的最低系统版本一致（ios/project.yml） | matches the project's minimum system version (ios/project.yml)
+
+
+class Platform(Enum):
+    # Mach-O platform identifiers: https://github.com/apple-oss-distributions/xnu/blob/e6231be02a03711ca404e5121a151b24afbff733/EXTERNAL_HEADERS/mach-o/loader.h
+    IOS = ('ios', 2, 'iPhoneOS')
+    IOS_SIMULATOR = ('ios-simulator', 7, 'iPhoneSimulator')
+
+    @classmethod
+    def parse(cls, name):
+        for value in cls:
+            if value.value[0] == name:
+                return value
+        raise ValueError('unsupported Guest platform: ' + str(name))
+
+
+def check_platform(platform):
+    if not isinstance(platform, Platform):
+        raise ValueError('Guest platform must be a Platform value')
 
 
 def r16(x): return (x + PG - 1) & ~(PG - 1)
@@ -62,12 +81,16 @@ def adhoc_sig(data, text_size):
     return struct.pack('>IIIII', 0xfade0cc0, 20 + len(cd), 1, 0, 20) + cd
 
 
-def build(out, names):
+def build(out, names, platform=Platform.IOS):
+    check_platform(platform)
     text, wsegs = [], []
     for n in names:
-        hdr = dict(l[2:].split() for l in open(os.path.join(out, n + '.fixups.tsv')) if l.startswith('# '))
+        with open(os.path.join(out, n + '.fixups.tsv')) as stream:
+            hdr = dict(l[2:].split() for l in stream if l.startswith('# '))
         te, po = int(hdr['TEXT_END'], 16), int(hdr['PATCH_OFF'], 16)
-        img = open(os.path.join(out, n + '.patched.bin'), 'rb').read(); sz = len(img); a, end = r16(te), r16(sz)
+        with open(os.path.join(out, n + '.patched.bin'), 'rb') as stream:
+            img = stream.read()
+        sz = len(img); a, end = r16(te), r16(sz)
         assert po % PG == 0 and a <= po <= end, (n, hex(te), hex(po), hex(sz))
         cut = lambda lo, hi: img[lo:min(hi, sz)].ljust(hi - lo, b'\0')
         text += [('__dm%sx0' % n, cut(0, a)), ('__dm%sx1' % n, cut(po, end))]
@@ -87,7 +110,7 @@ def build(out, names):
              struct.pack('<IIIIII', 0x2, 24, off, 0, off, len(strtab)),          # LC_SYMTAB：0 个符号 | LC_SYMTAB: 0 symbols
              struct.pack('<II18I', 0xb, 80, *([0] * 18)),                        # LC_DYSYMTAB
              struct.pack('<II16s', 0x1b, 24, uuid),                              # LC_UUID
-             struct.pack('<IIIIII', 0x32, 24, 2, MIN_IOS, MIN_IOS, 0),           # LC_BUILD_VERSION：平台 2 = iOS | LC_BUILD_VERSION: platform 2 = iOS
+             struct.pack('<IIIIII', 0x32, 24, platform.value[1], MIN_IOS, MIN_IOS, 0),
              dylib_cmd(0xc, b'/usr/lib/libSystem.B.dylib'),                      # LC_LOAD_DYLIB
              struct.pack('<IIII', 0x1d, 16, cs_off, cs_size)]                    # LC_CODE_SIGNATURE：放在最后一条，与 ld 一致 | LC_CODE_SIGNATURE: the last command, as ld places it
     lc = b''.join(cmds); assert 32 + len(lc) <= PG
@@ -96,31 +119,26 @@ def build(out, names):
     return (data + adhoc_sig(data, tsz)).ljust(cs_off + cs_size, b'\0')   # 签名覆盖 [0, cs_off) | the signature covers [0, cs_off)
 
 
-INFO_PLIST = '''<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>CFBundleExecutable</key><string>Guest</string>
-<key>CFBundleIdentifier</key><string>%s</string>
-<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-<key>CFBundleName</key><string>Guest</string>
-<key>CFBundlePackageType</key><string>FMWK</string>
-<key>CFBundleShortVersionString</key><string>1.0</string>
-<key>CFBundleVersion</key><string>1</string>
-<key>MinimumOSVersion</key><string>26.0</string>
-<key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
-</dict></plist>
-'''
-
-
-def write(out, dst, names, bundle_id='local.guest'):
+def write(out, dst, names, bundle_id='local.guest', platform=Platform.IOS):
+    check_platform(platform)
     fw = os.path.join(dst, 'Guest.framework'); os.makedirs(fw, exist_ok=True)
-    data = build(out, names)
+    data = build(out, names, platform)
     with open(os.path.join(fw, 'Guest'), 'wb') as f: f.write(data)
-    with open(os.path.join(fw, 'Info.plist'), 'w', encoding='utf-8', newline='\n') as f: f.write(INFO_PLIST % bundle_id)
+    info = dict(CFBundleExecutable='Guest', CFBundleIdentifier=bundle_id,
+                CFBundleInfoDictionaryVersion='6.0', CFBundleName='Guest',
+                CFBundlePackageType='FMWK', CFBundleShortVersionString='1.0',
+                CFBundleVersion='1', MinimumOSVersion='26.0',
+                CFBundleSupportedPlatforms=[platform.value[2]])
+    with open(os.path.join(fw, 'Info.plist'), 'wb') as f: plistlib.dump(info, f)
     return fw, len(data)
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 4: sys.exit(__doc__ or '用法：guest_dylib.py <产物目录> <输出目录> <模块名...>')
-    fw, n = write(sys.argv[1], sys.argv[2], sys.argv[3:])
+    parser = argparse.ArgumentParser(description='Generate an ARM64 Guest framework from derived modules.')
+    parser.add_argument('--platform', choices=[p.value[0] for p in Platform], default='ios')
+    parser.add_argument('modules_dir')
+    parser.add_argument('output_dir')
+    parser.add_argument('modules', nargs='+')
+    args = parser.parse_args()
+    fw, n = write(args.modules_dir, args.output_dir, args.modules, platform=Platform.parse(args.platform))
     print('%s：%d 字节' % (fw, n))

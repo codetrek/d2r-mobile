@@ -13,6 +13,12 @@ Read these first; this document does not repeat them:
 
 In this document `$DM_ROOT` means the workspace root (default `~/dm-work`). Relative paths in commands are relative to `dm/ios` unless stated otherwise.
 
+## Simulator development on this fork
+
+`main` tracks upstream; server and simulator changes live on `with-server`. The dedicated `DmIOSSimulator` builder creates an ARM64 iPhoneSimulator app with a freshly generated platform7 Guest.framework, an explicit Metal3 backend and verified source-MSL shader chain. Device generation keeps its platform2 default. Inputs and generated apps remain private under repository `.tmp`.
+
+The current private build and simulator TSD probe passed; entering a world, saved exit and shared-world multiplayer remain unqualified. Two builder provenance checks are being corrected before its success manifest is treated as complete. See [simulator tools](tools/simulator/README.md) for inputs, commands and the exact limits.
+
 ## How it works
 
 ### What gets packed into the app at build time
@@ -268,6 +274,8 @@ No device is needed, and the app is not launched. Contents:
 
 Under `tools/` there are also self-tests that come with a few of the scripts: `devlock_test.sh`, `devlock_max_test.sh`, `devlock_locale_test.sh` (device lock), `devbattery_test.sh` (battery check).
 
+`python3 tests/test_simulator.py` checks device defaults, simulator platform, source shader chains and missing/corrupt BF variants with synthetic inputs. It requires Python3.12 or later and launches no game.
+
 ## Other scripts in tools/
 
 | Script | Purpose |
@@ -280,4 +288,5 @@ Under `tools/` there are also self-tests that come with a few of the scripts: `d
 | `lifecycle.sh` | One round of lifecycle testing on a real device: go to the background and come back to the foreground |
 | `screen_check.py`, `fullscreen_check.py` | Check orientation, black borders and stretching from whole-window screenshots |
 | `bootprof.sh`, `heat_ab.sh`, `gpu_read.sh`, `xtrace.sh` | Real-device measurements: startup timeline, heat comparison, GPU time, Instruments command-line recording |
+| `simulator/build.py`, `simulator/shaders.py` | Dedicated ARM64 simulator app and strict source-MSL cache checks; see [usage](tools/simulator/README.md) |
 | `asset_manifest.py` | Generates the manifest for the direct asset download path |

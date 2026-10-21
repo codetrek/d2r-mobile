@@ -56,6 +56,15 @@
 #include "nvn_refl.h"
 #include "nvn_cover.h"
 #include "dmsh_chain.h"   // DMSH_CHAIN：本源码树期望的 B 着色器库翻译链版本 | DMSH_CHAIN: the translation chain version of the B shader library expected by this source tree
+#ifdef DM_SIMULATOR_SHADER_CHAIN
+#if !TARGET_OS_SIMULATOR
+#error DM_SIMULATOR_SHADER_CHAIN is only valid for an iOS Simulator build
+#endif
+// The simulator build validates the complete source-MSL profile before selecting
+// its independent cache. Device builds retain the generated chain above.
+#undef DMSH_CHAIN
+#define DMSH_CHAIN DM_SIMULATOR_SHADER_CHAIN
+#endif
 #include "nvn_hmap.h"
 #include "../../host/dm.h"
 #import <CommonCrypto/CommonDigest.h>

@@ -13,7 +13,6 @@ import csv, hashlib, io, json, sys
 from pathlib import Path
 HERE = Path(__file__).resolve().parent; IOS = HERE.parent.parent
 sys.path.insert(0, str(HERE.parent))
-import romfs_art
 sha = lambda b: hashlib.sha256(b).hexdigest()
 canonical = lambda obj: json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()
 classes = ['amazon', 'Sorceress', 'Necromancer', 'paladin', 'Barbarian', 'Druid', 'Assassin', 'Warlock', 'SubMenu']
@@ -23,6 +22,7 @@ COMMON_ICON = {357: 20, 358: 22, 360: 24, 361: 30, 362: 32, 363: 34, 364: 36, 37
 
 
 def main(romfs):
+    import romfs_art
     mpath = IOS / 'Sources/TouchArt/native_art_manifest.json'; man = json.loads(mpath.read_text())
     tables = {}
     for t in man['official_tables']:
@@ -51,6 +51,16 @@ def main(romfs):
         rows.append([raw, char, frame])
     assert len({r[0] for r in rows}) == len(rows)
     if sha(canonical(rows)) != man['descriptor_index_sha256']: raise SystemExit('native_art：技能索引和冻结的不一致')
+    write_source(rows, man, IOS / 'Sources/dm_touch_native_art.c')
+    print(f'native_art：{len(rows)} 条技能索引、{len(atlases)} 张 PNG（原件 SHA256 + MD5、PNG SHA256 都核过）→ {art}')
+
+
+def write_source(rows, man, destination):
+    if sha(canonical(rows)) != man['descriptor_index_sha256']:
+        raise ValueError('native_art: derived descriptor index differs from the frozen original')
+    mpath = IOS / 'Sources/TouchArt/native_art_manifest.json'
+    atl = [next(a for a in man['assets'] if a['asset'] == 'dm_native_skill_%d.png' % i)
+           for i in range(len(classes))]
     gpath = IOS / 'docs/native_art_v1_geometry.json'; binding = IOS / 'docs/touch_layout_spec_native_binding_v5.json'
     out = ['/* Generated from frozen official Skills/Skilldesc; do not hand-edit rows. */', '#include "dm_touch_native_art.h"', '#include "../../host/dm_input.h"', '#include <stddef.h>',
            'const dm_ta_atlas dm_ta_atlases[DM_TA_ATLASES]={']
@@ -59,8 +69,7 @@ def main(romfs):
             f'const char dm_ta_binding_sha[]="{sha(binding.read_bytes())}";', 'static const struct { uint32_t id; int atlas,frame; } rows[]={']
     out += [' {%d,%d,%d},' % tuple(row) for row in rows]; out += ['};']
     out += [(HERE / 'implementation.c.inc').read_text()]
-    (IOS / 'Sources/dm_touch_native_art.c').write_text('\n'.join(out) + '\n')
-    print(f'native_art：{len(rows)} 条技能索引、{len(atlases)} 张 PNG（原件 SHA256 + MD5、PNG SHA256 都核过）→ {art}')
+    Path(destination).write_text('\n'.join(out) + '\n')
 
 
 if __name__ == '__main__':
