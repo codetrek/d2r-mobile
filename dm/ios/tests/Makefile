@@ -59,6 +59,7 @@ test: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL
 	$(GPU_CHECKPOINT_TARGET)
 	$(GPU_MEMORY_TARGET)
 	python3 test_simulator.py
+	python3 test_pso_native.py
 	./$(METAL_CACHE_TARGET)
 	./$(TARGET)
 	./t_skill_aim

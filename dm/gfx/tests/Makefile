@@ -12,6 +12,7 @@ BUFFER_IDENTITY_TEST=../../../.tmp/gfx-tests/t_buffer_identity
 ORDERED_CONSTANT_TEST=../../../.tmp/gfx-tests/t_ordered_constants
 CONSTANT_ORCHESTRATION_TEST=../../../.tmp/gfx-tests/t_constant_orchestration
 DEPTH_DUMMY_TEST=../../../.tmp/gfx-tests/t_depth_dummy
+PSO_PROFILE_TEST=../../../.tmp/gfx-tests/t_pso_profile
 CONSTANT_PREPARATION_EXTRACT=../../../.tmp/gfx-tests/constant_preparation.inc
 # 宿主 crash.c 一并链入：写保护单测走生产同一套缺页钩子
 # Host crash.c is linked in as well: the write-protect unit tests go through the same page-fault hook as production
@@ -59,8 +60,14 @@ t_rt_range: t_rt_range.m ../../host/crash.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_rt_range.m ../../host/crash.c $(filter-out ../nvn/nvn_mtl.m ../nvn/nvn_entry.S ../nvn/nvn_thunks.S,$(GFX)) $(FW)
 t_rt_depth_ro: t_rt_depth_ro.m ../../host/crash.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_rt_depth_ro.m ../../host/crash.c $(filter-out ../nvn/nvn_mtl.m ../nvn/nvn_entry.S ../nvn/nvn_thunks.S,$(GFX)) $(FW)
-t_pso_skey: t_pso_skey.m ../nvn/nvn_pso_skey.h ../nvn/nvn_obj.h
+t_pso_skey: t_pso_skey.m ../nvn/nvn_pso_skey.h ../nvn/nvn_pso_wire.h ../nvn/nvn_obj.h
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_skey.m -framework Foundation
+$(PSO_PROFILE_TEST): t_pso_profile.c ../nvn/nvn_pso_profile.h ../nvn/nvn_pso_wire.h ../nvn/nvn_obj.h ../nvn/nvn_tex.h ../nvn/include/nvn.h
+	mkdir -p $(@D)
+	clang -std=c11 $(CFLAGS) -Wextra -Werror -o $@ $<
+.PHONY: pso-profile
+pso-profile: $(PSO_PROFILE_TEST)
+	$(PSO_PROFILE_TEST)
 t_pfv: t_pfv.m ../../host/crash.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pfv.m ../../host/crash.c $(filter-out ../nvn/nvn_mtl.m ../nvn/nvn_entry.S ../nvn/nvn_thunks.S,$(GFX)) $(FW)
 $(SIMULATOR_BINDING_TEST): t_simulator_bindings.c ../nvn/nvn_buffer_map.h ../nvn/nvn_simulator.h
