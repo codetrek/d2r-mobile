@@ -101,4 +101,16 @@ make -C dm/ios/tests ../../../.tmp/ios-tests/t_gpu_probe_result ../../../.tmp/io
 
 五次启动的核心计算均通过。真实能力仍是 Apple2/Tier1，Metal3 family、BC 和统一内存均为 false；architecture API 可用但值为空，Metal 映像来自模拟器运行时。这些结果只证明本次自有小缓冲和计算路径，不证明任意 malloc/Guest 池包装、驻留集、全量游戏着色器或游戏渲染可用。实际游戏前置检查保持原样。
 
+## 模拟器着色器源码派生
+
+`shader_profile.py` 提供 `transform_shader`、`derive_cache` 和 `validate_derived`。它读取只读的原始 MSL 源码及反射数据，仅合并绑定种类和寄存器完全相同的采样器字段，同步改写成员引用与密集参数编号，保留原计算；不支持的源码预处理、引用形状或元数据会明确失败。生成物采用包含输入、代码、选项和能力配置身份的新链，排除 BF，固定为未经过 Metal/渲染资格验证的源码结果。
+
+全部 6,927 个基础键完成 CPU 派生与 canonical replay，移除 12,511 个重复采样器字段，最大绑定数 67→46、采样器字段 27→10。25 项合成测试、独立的原始负例及完整输出复核通过。实际 `c1_guard.py` 对原始和派生源码均生成相同的 170 个有序守卫键；派生文件的新链头由生成器真正产生。PSO 中的融合或合并条目需要相应配置过滤与生成，不能直接复制或改名冒充兼容元数据。
+
+独立输出验证检查完整 schema、来源声明、精确键和文件集合、逐键别名证明与计数关系；调用者显式提供原始缓存、资格清单和预期键集时，还会重新计算全部转换。`derive_cache` 在发布前执行这一完整 replay。Metal 编译、原生参数编码、格式和真实游戏场景仍需后续验证，构建器尚未自动启用该派生配置。
+
+```sh
+python3 dm/ios/tests/test_shader_profile.py
+```
+
 Apple 的[模拟器 Metal 指南](https://developer.apple.com/documentation/metal/developing-metal-apps-that-run-in-simulator)说明模拟器提供近似 Apple family2 的功能，且不支持片元输入读取颜色附件。[零复制缓冲 API](https://developer.apple.com/documentation/metal/mtldevice/makebuffer(bytesnocopy:length:options:deallocator:))还要求页对齐和单一 VM 区域。宿主硬件型号与模拟器机型均不能替代这些契约和计算检查。
