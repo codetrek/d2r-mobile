@@ -12,6 +12,8 @@
 #include "dm_gpu_probe_result.h"
 #include "../../host/dm_vm.h"
 #include "../../gfx/nvn/nvn_buffer_identity.h"
+#include "../../gfx/nvn/nvn_ordered_constants.h"
+#include "../../gfx/nvn/nvn_native_arguments.h"
 #include "dm_gpu_probe_checkpoint.h"
 
 void plog(const char *format, ...);
@@ -210,6 +212,128 @@ static NSDictionary *compute(id<MTLDevice> device, id<MTLCommandQueue> queue, BO
     return compute_at(device, queue, arguments, supplied, observed, owner, 0, nil, nil);
 }
 
+static NSDictionary *ordered_constants(id<MTLDevice> device, id<MTLCommandQueue> queue, BOOL (^publish)(NSDictionary *)) {
+    NSMutableDictionary *result = [@{@"status": @"pending", @"stage": @"compile_ordered_kernels", @"iterations_requested": @3} mutableCopy];
+    NSDictionary *(^failed)(NSString *, NSString *, NSError *) = ^NSDictionary *(NSString *status, NSString *stage, NSError *error) {
+        [result addEntriesFromDictionary:failure(status, stage, error)]; return result;
+    };
+    if (!publish(result)) return failed(@"error", @"result_persistence", nil);
+    NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "kernel void write_source(device uint *p [[buffer(0)]], constant uint &seed [[buffer(1)]], uint i [[thread_position_in_grid]]) {"
+        "p[i+1]=i+1+seed*128; if(i<16) p[65+i]=as_type<uint>(float(i+1)); }"
+        "struct A { constant uint *x [[id(0)]]; constant float *m [[id(1)]]; device uint *out [[id(2)]]; };"
+        "kernel void consume(constant A &a [[buffer(0)]], uint i [[thread_position_in_grid]]) {"
+        "a.out[i]=a.x[i]^0x5a5a5a5au; if(i<16) a.out[65+i]=as_type<uint>(a.m[i]);"
+        "if(i==0) { uint z=0; for(uint j=64;j<128;j++)z|=a.x[j]; for(uint j=16;j<64;j++)z|=as_type<uint>(a.m[j]); a.out[64]=z; } }";
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    if (!library) return failed(@"error", @"compile_ordered_library", error);
+    id<MTLFunction> write = [library newFunctionWithName:@"write_source"], read = [library newFunctionWithName:@"consume"];
+    if (!write || !read) return failed(@"error", @"ordered_lookup_functions", nil);
+    id<MTLComputePipelineState> writer = [device newComputePipelineStateWithFunction:write error:&error];
+    if (!writer) return failed(@"error", @"ordered_writer_pipeline", error);
+    id<MTLComputePipelineState> reader = [device newComputePipelineStateWithFunction:read error:&error];
+    if (!reader) return failed(@"error", @"ordered_reader_pipeline", error);
+    id<MTLComputePipelineState> matrix = nvn_constant_matrix_pipeline(device, &error);
+    if (!matrix) return failed(@"error", @"ordered_matrix_pipeline", error);
+    NvnConstantPool *pool = [[NvnConstantPool alloc] initWithDevice:device budget:1536];
+    DmGpuMemory *owner = [DmGpuMemory new]; owner.backing = BackingVM; owner.length = 131072;
+    vm_address_t pages = 0;
+    if (vm_allocate(mach_task_self(), &pages, owner.length, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
+        return failed(@"error", @"ordered_vm_allocation", nil);
+    owner.pointer = (void *)pages;
+    dm_vm_pool_region region;
+    if (dm_vm_pool_check(owner.pointer, owner.length, &region) != KERN_SUCCESS || region.base != pages || region.length != owner.length)
+        return failed(@"error", @"ordered_vm_region", nil);
+    result[@"stage"] = @"wrap_ordered_writer_alias";
+    result[@"backing_ownership"] = @"owned_vm_retained_by_both_actual_buffer_deallocators";
+    result[@"region_bytes"] = @(region.region_length); result[@"protection"] = @(region.protection);
+    result[@"wrapped_bytes"] = @(owner.length);
+    if (!publish(result)) return failed(@"error", @"result_persistence", nil);
+    MTLResourceOptions sourceOptions = MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked;
+    id<MTLBuffer> original = [device newBufferWithBytesNoCopy:owner.pointer length:owner.length options:sourceOptions
+        deallocator:^(void *memory, NSUInteger length) { (void)memory; (void)length; (void)owner.length; }];
+    if (!nvn_buffer_identity(original, owner.pointer, owner.length, device)) return failed(@"error", @"ordered_writer_alias_identity", nil);
+    result[@"stage"] = @"wrap_ordered_reader_alias";
+    if (!publish(result)) return failed(@"error", @"result_persistence", nil);
+    id<MTLBuffer> alias = [device newBufferWithBytesNoCopy:owner.pointer length:owner.length options:sourceOptions
+        deallocator:^(void *memory, NSUInteger length) { (void)memory; (void)length; (void)owner.length; }];
+    if (!nvn_buffer_identity(alias, owner.pointer, owner.length, device)) return failed(@"error", @"ordered_reader_alias_identity", nil);
+    result[@"writer_hazard_mode"] = @(original.hazardTrackingMode); result[@"reader_hazard_mode"] = @(alias.hazardTrackingMode);
+    if (original == alias || original.hazardTrackingMode != MTLHazardTrackingModeUntracked || alias.hazardTrackingMode != MTLHazardTrackingModeUntracked)
+        return failed(@"unsupported", @"ordered_alias_hazard_mode", nil);
+    id<MTLBuffer> observed = [device newBufferWithLength:512 options:MTLResourceStorageModeShared];
+    if (!pool || !observed) return failed(@"error", @"ordered_allocation", nil);
+    unsigned completedIterations = 0;
+    for (uint32_t seed = 0; seed < 3; seed++) {
+        @autoreleasepool {
+            if ([pool beginCompleted:seed]) return failed(@"error", @"ordered_batch_begin", nil);
+            memset(observed.contents, 0xCD, observed.length);
+            id<MTLCommandBuffer> command = [queue commandBuffer];
+            if (!command || !command.retainedReferences) return failed(@"error", @"ordered_retained_command", nil);
+            id<MTLComputeCommandEncoder> writeEncoder = [command computeCommandEncoder];
+            if (!writeEncoder) return failed(@"error", @"ordered_write_encoder", nil);
+            [writeEncoder setComputePipelineState:writer]; [writeEncoder setBuffer:original offset:0 atIndex:0];
+            [writeEncoder setBytes:&seed length:sizeof seed atIndex:1];
+            [writeEncoder dispatchThreadgroups:MTLSizeMake(64,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)]; [writeEncoder endEncoding];
+            id<MTLBlitCommandEncoder> blit = [pool beginCopyCommand:command];
+            if (!blit) return failed(@"unsupported", @"ordered_event_barrier", nil);
+            id<MTLBuffer> x, m;
+            NvnConstantStatus xStatus = [pool prepareSource:alias offset:4 length:256 required:512 alignment:16 blit:blit buffer:&x];
+            NvnConstantStatus mStatus = [pool prepareSource:alias offset:260 length:64 required:128 alignment:16 blit:blit buffer:&m];
+            if (xStatus || mStatus) return failed(@"error", @"ordered_prepare", nil);
+            [blit endEncoding];
+            if (nvn_constant_matrix_encode(command, matrix, m, .25f)) return failed(@"error", @"ordered_matrix_encode", nil);
+            id<MTLArgumentEncoder> arguments = [read newArgumentEncoderWithBufferIndex:0];
+            if (!arguments || !nvn_sim_argument_layout(arguments.encodedLength, arguments.alignment)) return failed(@"unsupported", @"ordered_argument_layout", nil);
+            id<MTLBuffer> argumentBuffer = [device newBufferWithLength:arguments.encodedLength options:MTLResourceStorageModeShared];
+            if (!argumentBuffer) return failed(@"error", @"ordered_arguments", nil);
+            [arguments setArgumentBuffer:argumentBuffer offset:0];
+            if (nvn_native_encode_constant(arguments, x, 512, 16, 0) || nvn_native_encode_constant(arguments, m, 128, 16, 1))
+                return failed(@"error", @"ordered_native_setter", nil);
+            [arguments setBuffer:observed offset:0 atIndex:2];
+            id<MTLComputeCommandEncoder> consumer = [command computeCommandEncoder];
+            if (!consumer) return failed(@"error", @"ordered_consumer_encoder", nil);
+            [consumer setComputePipelineState:reader]; [consumer setBuffer:argumentBuffer offset:0 atIndex:0];
+            [consumer useResource:x usage:MTLResourceUsageRead]; [consumer useResource:m usage:MTLResourceUsageRead];
+            [consumer useResource:observed usage:MTLResourceUsageWrite];
+            [consumer dispatchThreadgroups:MTLSizeMake(64,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)]; [consumer endEncoding];
+            if ([pool commitFence:seed+1]) return failed(@"error", @"ordered_batch_commit", nil);
+            dispatch_semaphore_t done = dispatch_semaphore_create(0);
+            [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+                (void)original.length; (void)alias.length; (void)owner.length; (void)observed.length; (void)x.length; (void)m.length; (void)argumentBuffer.length; (void)completed;
+                dispatch_semaphore_signal(done);
+            }];
+            result[@"stage"] = @"ordered_gpu_completion"; result[@"iteration_pending"] = @(seed);
+            if (!publish(result)) return failed(@"error", @"result_persistence", nil);
+            [command commit];
+            if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 5*NSEC_PER_SEC))) return failed(@"timeout", @"ordered_gpu_completion", nil);
+            if (command.status != MTLCommandBufferStatusCompleted) return failed(@"error", @"ordered_gpu_completion", command.error);
+            const uint32_t *words = observed.contents;
+            BOOL values = YES, adjusted = YES, guards = YES;
+            for (unsigned i = 0; i < 64; i++) if (words[i] != ((i+1+seed*128)^UINT32_C(0x5a5a5a5a))) values = NO;
+            for (unsigned i = 0; i < 16; i++) { float expected = i+1;
+                if (i%4 == 1) expected += .25f*(i+3);
+                float actual; memcpy(&actual, &words[65+i], sizeof actual); if (actual != expected) adjusted = NO;
+            }
+            for (unsigned i = 81; i < 128; i++) if (words[i] != UINT32_C(0xcdcdcdcd)) guards = NO;
+            BOOL zero = words[64] == 0;
+            result[@"word_count"] = @64; result[@"output_match"] = @(values); result[@"zero_tail_match"] = @(zero);
+            result[@"matrix_transform_match"] = @(adjusted); result[@"surrounding_bytes_unchanged"] = @(guards);
+            if (!values || !zero || !adjusted || !guards) { result[@"status"] = @"error"; result[@"stage"] = @"ordered_readback"; return result; }
+            completedIterations++;
+        }
+    }
+    [result removeObjectForKey:@"iteration_pending"];
+    result[@"completed_iterations"] = @(completedIterations); result[@"allocation_count"] = @(pool.allocationCount);
+    result[@"reuse_count"] = @(pool.reuseCount); result[@"allocated_bytes"] = @(pool.allocatedBytes); result[@"budget_bytes"] = @1536;
+    result[@"source_backing_bytes"] = @(original.length); result[@"source_offsets"] = @[@4, @260];
+    result[@"same_command_stream"] = @YES; result[@"source_written_on_gpu"] = @YES;
+    result[@"distinct_untracked_aliases"] = @YES; result[@"explicit_event_barrier"] = @YES;
+    result[@"status"] = pool.allocationCount == 2 && pool.reuseCount == 4 && pool.allocatedBytes == 768 ? @"passed" : @"error";
+    result[@"stage"] = @"ordered_readback"; return result;
+}
+
 static NSDictionary *protected_pool(id<MTLDevice> device, id<MTLCommandQueue> queue, BOOL (^publish)(NSDictionary *)) {
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
     NSDictionary *(^failed)(NSString *, NSError *) = ^NSDictionary *(NSString *stage, NSError *error) {
@@ -392,6 +516,12 @@ int dm_gpu_probe(void) {
                 else if (!shared || ![queue respondsToSelector:@selector(addResidencySet:)]) tests[@"residency_set"] = failure(@"unsupported", @"queue_residency", nil);
                 else { [set addAllocation:shared]; [set commit]; [queue addResidencySet:set]; [queue removeResidencySet:set]; tests[@"residency_set"] = @{@"status": @"passed", @"queue_registration": @YES}; }
             }
+        }
+        if (selection == DM_GPU_CASE_CONSTANTS || selection == DM_GPU_CASE_ALL) {
+            if (!begin_test(result, path, @"ordered_constants")) return 1;
+            tests[@"ordered_constants"] = ordered_constants(device, queue, ^BOOL(NSDictionary *detail) {
+                tests[@"ordered_constants"] = detail; return write_report(result, path, NO);
+            });
         }
         const enum dm_gpu_probe_case cases[] = {DM_GPU_CASE_VM, DM_GPU_CASE_SHARED, DM_GPU_CASE_ALIAS, DM_GPU_CASE_POOL, DM_GPU_CASE_MALLOC};
         NSString *names[] = {@"nocopy_vm", @"nocopy_shared", @"buffer_alias", @"protected_pool", @"nocopy_malloc"};

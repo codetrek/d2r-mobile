@@ -19,6 +19,7 @@
 #include "nvn_buffer_map.h"
 #include "nvn_buffer_identity.h"
 #include "nvn_native_arguments.h"
+#include "nvn_ordered_constants.h"
 // 编译期开关 DM_NVN_M3=1：图形后端走老接口（普通命令队列 / 命令缓冲 / 渲染与计算与拷贝编码器，逐槽绑定缓冲，对参数块引用的资源逐个声明），
 // 目标 macOS 15 / iOS 18。缺省 0 = Metal 4（macOS 26 / iOS 26）。两支共用同一份回放逻辑，分叉处都在 #if DM_NVN_M3 里
 // Compile-time switch DM_NVN_M3=1: the graphics backend uses the older API (ordinary command queue / command buffers / render, compute and copy encoders, buffers bound per slot, each resource referenced by an argument block declared individually),
@@ -158,6 +159,7 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 #if DM_NVN_SIMULATOR
 static int g_sim_sub_active;
 static _Atomic uint64_t g_sim_planned_fence;
+static NvnConstantPool *g_sim_constants;
 #endif
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_done;                         // 已完成的最大栅栏值（完成回调写） | Highest completed fence value (written by the completion callback)
@@ -767,6 +769,11 @@ void mtl_sub_begin(void) {
     g_vis = g_vis_ring[pick].buf;
     void pg_sub_begin_ext(uint64_t fence); pg_sub_begin_ext(g_fence + 1);
     void arena_begin(void); arena_begin();
+#if DM_NVN_SIMULATOR
+    if (!g_sim_constants) g_sim_constants = [[NvnConstantPool alloc] initWithDevice:g_dev budget:128u << 20];
+    pthread_mutex_lock(&g_mu); uint64_t constant_done = g_done; pthread_mutex_unlock(&g_mu);
+    if (!g_sim_constants || [g_sim_constants beginCompleted:constant_done]) MDIE("Simulator constant batch begin failed");
+#endif
 }
 
 static void rp_end(void);
@@ -1046,6 +1053,9 @@ uint64_t mtl_sub_commit(void) {
     }];
     pg_commit(FB_ON(o, g_cb));   // 逐通道 GPU 计时（DM_NVN_PASSGPU）：没开时直接返回 | Per-pass GPU timing (DM_NVN_PASSGPU): returns immediately when off
     void arena_commit(uint64_t fence); arena_commit(fence);
+#if DM_NVN_SIMULATOR
+    if ([g_sim_constants commitFence:fence]) MDIE("Simulator constant batch commit failed");
+#endif
     res_commit();
 #if DM_NVN_M3
     [g_cb encodeSignalEvent:g_ev value:fence];
@@ -3230,7 +3240,9 @@ static uint64_t zero_bank_gpu(void) { static uint64_t gpu; if (!gpu) gpu = buffe
 // Moving the viewport is not used: the viewport's top edge is the edge of the clip volume, so top-anchored widgets that the host lifts back to the real top of the picture (UI coordinate y negative) would be clipped away entirely.
 // g_ui_moff is set per draw by draw() (0 = no change); the copies live in a ring buffer, and the same address in the same pass is copied only once.
 static double g_ui_moff;
-static int ui_mat_ok(void) { const p_bind_buf *u = &S.ubo[0][0]; void *mb; uint64_t mo; return u->addr && u->size >= 64 && u->size <= 4096 && !pend_hits(u->addr, u->size) && mtl_addr(u->addr, u->size, &mb, &mo); }
+static int ui_mat_ok(void) { const p_bind_buf *u = &S.ubo[0][0]; void *mb; uint64_t mo;
+    return u->addr && u->size >= 64 && u->size <= (DM_NVN_SIMULATOR ? NVN_SIM_CONSTANT_LIMIT : 4096) &&
+        (DM_NVN_SIMULATOR || !pend_hits(u->addr, u->size)) && mtl_addr(u->addr, u->size, &mb, &mo); }
 static uint64_t ui_mat_patch(const p_bind_buf *u, void *mb, uint64_t mo) {
     enum { RING = 4 << 20 }; static __strong id<MTLBuffer> ring; static uint64_t ring_gpu, la, ls, lp, lg; static size_t at; static double lo;
     if (!ring) { ring = [g_dev newBufferWithLength:RING options:MTLResourceStorageModeShared]; res_add(ring); ring_gpu = buffer_address(ring); }
@@ -3261,13 +3273,90 @@ static inline int m3_use_seen(void *p, uint32_t u) {
     return 0;
 }
 #endif
+#if DM_NVN_SIMULATOR
+static id<MTLBuffer> g_sim_prepared[6][NVN_REFL_MAXB];
+static int g_sim_constant_copy_begin;
+static int sim_constant_kind(int kind) {
+    return kind == NVN_RB_CBUF || kind == NVN_RB_C1 || kind == NVN_RB_SUPPORT || kind == NVN_RB_DRV0 || kind == NVN_RB_DRV2;
+}
+static id<MTLBuffer> sim_copy_constant(id<MTLBuffer> source, uint64_t offset, uint64_t length, NSUInteger required, NSUInteger alignment) {
+    if (g_sim_constant_copy_begin) {
+        rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+        g_blit = [g_sim_constants beginCopyCommand:g_cb]; g_sim_constant_copy_begin = 0;
+        if (!g_blit) MDIE("Simulator constant synchronization event/encoder is unavailable");
+    }
+    id<MTLBuffer> buffer;
+    NvnConstantStatus status = [g_sim_constants prepareSource:source offset:offset length:length required:required alignment:alignment blit:g_blit buffer:&buffer];
+    if (status) MDIE("Simulator ordered constant rejected: status=%d span=%llu required=%lu alignment=%lu staging=%lu", status,
+        (unsigned long long)length, (unsigned long)required, (unsigned long)alignment, (unsigned long)g_sim_constants.allocatedBytes);
+    return buffer;
+}
+static void sim_prepare_constants(NvShader *sh, int stage, double matrixOffset) {
+    // Ending the old pass can replay a ghost draw recursively. Drain it before
+    // constructing this draw's slots; restoring S does not restore prepared slots.
+    rp_end();
+    g_sim_constant_copy_begin = 1;
+    for (int i = 0; i < NVN_REFL_MAXB; i++) g_sim_prepared[stage][i] = nil;
+    if (!sh || !sh->ae) return;
+    id<MTLBuffer> matrix;
+    for (int i = 0; i < sh->rf.nb; i++) {
+        const nvn_rbind *binding = &sh->rf.b[i]; int kind = binding->kind, reg = binding->reg, aid = binding->aid;
+        if (!sim_constant_kind(kind)) continue;
+        id<MTLBuffer> source; uint64_t offset = 0, length = 65536; BOOL immutable = YES;
+        if (kind == NVN_RB_CBUF) {
+            const p_bind_buf *u = reg < 16 ? &S.ubo[stage][reg] : NULL;
+            if (!u || !u->addr) source = zero_bank();
+            else {
+                void *object;
+                if (!u->size || u->size > NVN_SIM_CONSTANT_LIMIT || !mtl_addr(u->addr, u->size, &object, &offset))
+                    MDIE("Simulator shader=%s cb%d source span is unavailable or exceeds 64 KiB", sh->key, reg);
+                source = (__bridge id<MTLBuffer>)object; length = u->size; immutable = NO;
+            }
+        } else if (kind == NVN_RB_C1) { source = sh->c1buf ? sh->c1buf : zero_bank(); offset = sh->c1off; }
+        else if (kind == NVN_RB_SUPPORT) source = support_buf();
+        else {
+            int bank = kind == NVN_RB_DRV2 ? 2 : 0;
+            if (!sh->rf.drv_read[bank]) source = zero_bank();
+            else {
+                size_t at = arena_alloc(0xA00, &source); offset = at; length = 0xA00; immutable = NO;
+                uint8_t *d = (uint8_t *)source.contents + at; memset(d, 0, length);
+                if (!bank) {
+                    int base = stage == 0 ? 0x110 : stage == 5 ? 0x310 : stage == 1 ? 0x510 : -1;
+                    if (base < 0) MDIE("Simulator driver c0 stage is unsupported: %d", stage);
+                    for (int r = 0; r < 16; r++) { uint64_t address = S.ssbo[stage][r].addr; uint32_t size = (uint32_t)S.ssbo[stage][r].size;
+                        memcpy(d + base + 16*r, &address, 8); memcpy(d + base + 16*r + 8, &size, 4); }
+                } else for (int r = 0; r < 128; r++) { uint32_t texture = (uint32_t)S.tex[stage][r], sampler = (uint32_t)S.samp[stage][r];
+                    memcpy(d + 0x168 + 8*r, &texture, 4); memcpy(d + 0x568 + 8*r, &sampler, 4); }
+            }
+        }
+        if (immutable) {
+            if (!source || offset || source.length != length || source.device != g_dev || !sh->native_required[aid] ||
+                sh->native_required[aid] > length || !sh->native_alignment[aid] ||
+                (sh->native_alignment[aid] & (sh->native_alignment[aid]-1)) || sh->native_alignment[aid] > NVN_SIM_CONSTANT_LIMIT)
+                MDIE("Simulator immutable constant layout is unproved: shader=%s reg=%d", sh->key, reg);
+            g_sim_prepared[stage][aid] = source;
+        } else g_sim_prepared[stage][aid] = sim_copy_constant(source, offset, length, sh->native_required[aid], sh->native_alignment[aid]);
+        if (stage == 0 && kind == NVN_RB_CBUF && reg == 0 && matrixOffset != 0) {
+            if (immutable || length < 64) MDIE("Simulator UI matrix source is unavailable");
+            matrix = g_sim_prepared[stage][aid];
+        }
+    }
+    if (matrix) {
+        if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+        static id<MTLComputePipelineState> pipeline;
+        if (!pipeline) { NSError *error = nil; pipeline = nvn_constant_matrix_pipeline(g_dev, &error);
+            if (!pipeline) MDIE("Simulator ordered UI matrix pipeline failed: %s", error.localizedDescription.UTF8String); }
+        if (nvn_constant_matrix_encode(g_cb, pipeline, matrix, (float)matrixOffset)) MDIE("Simulator ordered UI matrix encode failed");
+    }
+}
+#endif
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
     if (!sh->ae) return 1;
 #if !DM_NVN_SIMULATOR
     uint64_t slots[NVN_REFL_MAXB] = {0};
 #endif
     args_sync_dirty();
-    if (!passdump() && !g_args_dirty[nvn_stage] && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5) {
+    if (!DM_NVN_SIMULATOR && !passdump() && !g_args_dirty[nvn_stage] && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5) {
         bind_args(en, nvn_stage, metal_vertex, sh->ab_buf, sh->ab_gpu, sh->ab_off, sh->rf.abi);
         g_stat_args_reuse++;
         return 1;
@@ -3310,6 +3399,14 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     for (int i = 0; i < sh->rf.nb; i++) {
         const nvn_rbind *b = &sh->rf.b[i];
         int reg = b->reg, aid = b->aid;
+#if DM_NVN_SIMULATOR
+        if (sim_constant_kind(b->kind)) {
+            id<MTLBuffer> prepared = g_sim_prepared[nvn_stage][aid];
+            if (nvn_native_encode_constant(sh->ae, prepared, sh->native_required[aid], sh->native_alignment[aid], aid))
+                MDIE("Simulator prepared constant layout invalid: shader=%s reg=%d", sh->key, reg);
+            USE(prepared, MTLResourceUsageRead); continue;
+        }
+#endif
         if (b->kind == NVN_RB_CBUF) {
             const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
             void *mb; uint64_t mo, gpu;
@@ -4982,6 +5079,17 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!g_enc && tbdr_on() && !defer_has_in_p() && !g_defer_replaying && !g_fz.active && !g_fz_checking && g_exec_next) { defer_try(dw, di); if (g_defer_cur->active && g_defer_cur->in_p) return; }
     if (!g_enc && tb_sub(TB_FUSE) && !g_fz_checking) fuse_try();   // 可读 tile 通道合并缺省开；结构 / 本像素证明不成立仍退回普通通道，CHECK 重画时不重入 | Readable tile render pass merge is on by default; when the structure / same-pixel proof does not hold it still falls back to a normal render pass, and it is not re-entered during the CHECK redraw
 frz_plain:;
+#if DM_NVN_SIMULATOR
+    long sim_vo = 0, sim_so = 0; double sim_moff = 0;
+    NSUInteger sim_tw = 0, sim_th = 0; rt_dims(&sim_tw, &sim_th);
+    if (g_ui_rect_fn && dw && dw->count == 4 && S.nattr == 2 && S.stream[0].stride == 20) { double uy = 0, uh = 1; g_ui_rect_fn(&uy, &uh);
+        if (uh > 0 && uh < 1) {
+            if (!ghost_tex()) MDIE("Simulator untextured partial-screen UI coverage is unproved");
+            if (uy > 0) { sim_so = lround(uy*sim_th); if (ui_mat_ok()) sim_moff = 2*uy; else sim_vo = sim_so; }
+        } }
+    g_ui_moff = sim_moff;
+    sim_prepare_constants(pr->sh[0], 0, sim_moff); sim_prepare_constants(pr->sh[1], 1, 0);
+#endif
     int need = g_enc || !tb_sub(TB_DS) ? 3 : pass_ds_need(), mode = defer_q_draw ? 0 : need == 0 ? 2 : need == 2 ? 3 : need == 1 ? 4 : 0;   // 2 都不挂 3 只挂模板 4 只挂深度 | 2 attach neither, 3 attach stencil only, 4 attach depth only
     int skip_d = mode != 0;
     if (!g_enc) { g_fd_dw = dw; g_fd_di = di; }
@@ -5019,10 +5127,14 @@ frz_plain:;
     // A scissor starting from the top edge (y <= 0) does not have its top edge moved down: when the host lifts top-anchored widgets (minimap, area name etc.) back to the real top of the picture, they are drawn above the UI rectangle and must not be clipped.
     // Exception: the untextured block that exactly covers the whole UI rectangle (the dimming when a panel opens, the black curtain of a transition) is changed to cover the whole picture -- the viewport is scaled vertically by 1/h and not moved down, otherwise the 3D outside the UI rectangle is left with a light/dark dividing line.
     // When nobody registered the entry or the UI rectangle is the whole picture (iPhone, Mac default), vo = so = 0, vs = 1, the matrix is not changed, and what follows is word-for-word the same as before.
+#if DM_NVN_SIMULATOR
+    long vo = sim_vo, so = sim_so; double vs = 1;
+#else
     long vo = 0, so = 0; double vs = 1, moff = 0;
     if (g_ui_rect_fn && dw && dw->count == 4 && S.nattr == 2 && S.stream[0].stride == 20) { double uy = 0, uh = 1; g_ui_rect_fn(&uy, &uh);
         if (uh > 0 && uh < 1) { if (ui_cover_all(uh)) vs = 1 / uh; else if (uy > 0) { so = lround(uy * th); if (ui_mat_ok()) moff = 2 * uy; else { vo = so; static int n; if (n++ < 4) MLOG("界面下移：投影矩阵这次读不到，退回挪视口（通道 %llu）", g_stat_pass); } } } }
     if (moff != g_ui_moff) { g_ui_moff = moff; g_args_dirty[0] = 1; }
+#endif
     { MTLViewport v = S.has_vp ? (MTLViewport){S.vp[0][0], S.vp[0][1] + vo, S.vp[0][2], S.vp[0][3] * vs, S.dr[0], S.dr[1]} : (MTLViewport){0, vo, tw, th * vs, 0, 1};
       FX_SET(0, !memcmp(&g_enc_fx.vp, &v, sizeof v), g_enc_fx.vp = v, enc_r_viewport(en, v)); }
     MTLScissorRect sc = {0, 0, tw, th};
@@ -5306,20 +5418,40 @@ static void dispatch(const p_dispatch *dp) {
         if (!mtl_addr(u->addr, 4, &ub, &uo) || !mtl_addr(a0->addr, 8, &sb, &so) || !mtl_addr(a1->addr, 8, &db, &dof)) { RED_ONCE(30, "内嵌计算核 %s 的缓冲没绑全", cs->builtin); return; }
         if (!cs->logged++) {
             module_t *m = module_of((void *)dp->caller);
+#if DM_NVN_SIMULATOR
+            MLOG("Simulator builtin %s first dispatch: caller=%s+%#llx groups=%dx%dx%d; constant is read on GPU", cs->builtin, m ? m->name : "?",
+                 m ? (unsigned long long)(dp->caller - (uint64_t)m->base) : (unsigned long long)dp->caller, dp->x, dp->y, dp->z);
+#else
             MLOG("内嵌计算核 %s 首次派发：调用点 %s+%#llx，线程组 %dx%dx%d，元素数（CPU 侧当前值）%u", cs->builtin, m ? m->name : "?",
                  m ? (unsigned long long)(dp->caller - (uint64_t)m->base) : (unsigned long long)dp->caller, dp->x, dp->y, dp->z, *(uint32_t *)u->addr);
+#endif
         }
-        rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+        rp_end();
+#if DM_NVN_SIMULATOR
+        if (!u->size || !mtl_addr(u->addr, u->size, &ub, &uo)) MDIE("Simulator builtin constant full span is unproved");
+        g_sim_constant_copy_begin = 1;
+        id<MTLBuffer> constant = sim_copy_constant((__bridge id<MTLBuffer>)ub, uo, u->size, 4, 4);
+#endif
+        if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
         id<MTLComputeCommandEncoder> ce = pg_compute();
         enc_c_pso(ce, ps);
-        enc_c_args(ce, buffer_address((__bridge id<MTLBuffer>)ub) + uo, 0); enc_c_args(ce, buffer_address((__bridge id<MTLBuffer>)sb) + so, 1); enc_c_args(ce, buffer_address((__bridge id<MTLBuffer>)db) + dof, 2);   // 内嵌计算核：冷路径，直接取地址 | Built-in compute kernel: cold path, take the addresses directly
+#if DM_NVN_SIMULATOR
+        [ce setBuffer:constant offset:0 atIndex:0];
+#else
+        enc_c_args(ce, buffer_address((__bridge id<MTLBuffer>)ub) + uo, 0);
+#endif
+         enc_c_args(ce, buffer_address((__bridge id<MTLBuffer>)sb) + so, 1); enc_c_args(ce, buffer_address((__bridge id<MTLBuffer>)db) + dof, 2);   // 内嵌计算核：冷路径，直接取地址 | Built-in compute kernel: cold path, take the addresses directly
         enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(32, 1, 1));
         pg_compute_end(ce); enc_c_end(ce);
         return;
     }
     const uint16_t *tg = cs->rf.tg;
     if (!tg[0]) { RED_ONCE(29, "计算着色器缺线程组大小反射"); return; }
-    rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    rp_end();
+#if DM_NVN_SIMULATOR
+    sim_prepare_constants(cs, 5, 0);
+#endif
+    if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     id<MTLComputeCommandEncoder> ce = pg_compute();
     enc_c_pso(ce, ps);
     encode_args(ce, cs, 5, 0);

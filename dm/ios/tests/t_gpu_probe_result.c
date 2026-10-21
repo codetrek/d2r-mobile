@@ -3,8 +3,8 @@
 #include <stdio.h>
 
 int main(void) {
-    const char *cases[] = {"core", "residency", "nocopy-malloc", "nocopy-vm", "nocopy-shared", "buffer-alias", "protected-pool", "all"};
-    for (int i = 0; i < 8; i++) assert(dm_gpu_probe_parse_case(cases[i]) == (enum dm_gpu_probe_case)i);
+    const char *cases[] = {"core", "residency", "nocopy-malloc", "nocopy-vm", "nocopy-shared", "buffer-alias", "protected-pool", "ordered-constants", "all"};
+    for (int i = 0; i < 9; i++) assert(dm_gpu_probe_parse_case(cases[i]) == (enum dm_gpu_probe_case)i);
     assert(dm_gpu_probe_parse_case(NULL) == DM_GPU_CASE_INVALID);
     assert(dm_gpu_probe_parse_case("") == DM_GPU_CASE_INVALID);
     assert(dm_gpu_probe_parse_case("core-extra") == DM_GPU_CASE_INVALID);

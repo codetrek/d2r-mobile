@@ -18,3 +18,11 @@ static inline int nvn_native_encode_buffer(id<MTLArgumentEncoder> encoder, const
     [encoder setBuffer:buffer offset:(NSUInteger)offset atIndex:index];
     return 0;
 }
+
+static inline int nvn_native_encode_constant(id<MTLArgumentEncoder> encoder, id<MTLBuffer> buffer,
+                                              uint64_t required, uint64_t alignment, NSUInteger index) {
+    if (!encoder || !buffer || !required || !alignment || (alignment & (alignment - 1)) ||
+        alignment > NVN_SIM_CONSTANT_LIMIT || required > buffer.length ||
+        !nvn_sim_constant_range(buffer.length, 0, buffer.length)) return -1;
+    [encoder setBuffer:buffer offset:0 atIndex:index]; return 0;
+}
