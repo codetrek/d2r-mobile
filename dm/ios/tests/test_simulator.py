@@ -151,6 +151,20 @@ class Contracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'original input changed'):
             snapshot.verify(destination, proof, originals=True)
 
+    def test_readonly_snapshot_stages_owned_metadata_for_explicit_override(self):
+        source = self.root / 'snapshot'
+        (source / 'dm').mkdir(parents=True)
+        original = source / 'dm/main.fixups.tsv'
+        original.write_bytes(b'donor metadata')
+        original.chmod(0o444)
+        stage = self.root / 'stage'
+        snapshot.copy_tree_owned(source, stage)
+        replacement = self.root / 'selected-metadata'
+        replacement.write_bytes(b'selected metadata')
+        snapshot.shutil.copyfile(replacement, stage / 'dm/main.fixups.tsv')
+        self.assertEqual(original.read_bytes(), b'donor metadata')
+        self.assertEqual((stage / 'dm/main.fixups.tsv').read_bytes(), b'selected metadata')
+
     def test_snapshot_output_changes_and_extra_file(self):
         source = self.root / 'input'
         source.write_bytes(b'original')

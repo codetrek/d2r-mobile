@@ -226,7 +226,7 @@ def build(args):
             name = str(item.relative_to(app))
             resource_bindings[name] = groups['app_resources']['files'][name]
         if path.is_dir():
-            shutil.copytree(path, dst)
+            snapshot.copy_tree_owned(path, dst)
             source_inputs.update({str(p): sha(p) for p in path.rglob('*') if p.is_file()})
         else:
             shutil.copyfile(path, dst)

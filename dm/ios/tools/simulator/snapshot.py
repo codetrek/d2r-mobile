@@ -25,6 +25,15 @@ def tree_files(root, link_root=None):
     return paths
 
 
+def copy_tree_owned(source, destination):
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=False)
+    for name, path in tree_files(source):
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
+
+
 def capture(entries, destination):
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=False)
