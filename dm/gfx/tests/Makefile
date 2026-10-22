@@ -107,6 +107,7 @@ simulator-bindings: $(SIMULATOR_BINDING_TEST) $(NATIVE_ARGUMENT_TEST) $(BUFFER_I
 # 依赖一行一个、按字母序（免得加一个测试就整行冲突）；下面各条命令的先后不变
 # Dependencies one per line in alphabetical order (so that adding one test does not conflict on the whole line); the order of the commands below is unchanged
 run: \
+	$(PSO_PROFILE_TEST) \
 	$(PREPARED_ARGUMENTS_TEST) \
 	$(DEPTH_DUMMY_TEST) \
 	$(CONSTANT_ORCHESTRATION_TEST) \
@@ -140,6 +141,7 @@ run: \
 	t_xv \
 	t_zskip
 	./t_copy_pitch
+	$(PSO_PROFILE_TEST)
 	$(BUFFER_IDENTITY_TEST)
 	$(SIMULATOR_BINDING_TEST)
 	$(NATIVE_ARGUMENT_TEST)

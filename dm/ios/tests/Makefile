@@ -1,5 +1,6 @@
 DM_ROOT ?= $(HOME)/dm-work
 CC ?= cc
+PYTHON ?= python3
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -pedantic -O2
 TARGET = t_touch_controls
 METAL_CACHE_TARGET = t_metal_cache_guard
@@ -13,9 +14,11 @@ BINDING_FIXTURES = fixtures/native_binding/mapping.bin fixtures/native_binding/b
 HAVE_BINDING_FIXTURES := $(and $(wildcard fixtures/native_binding/mapping.bin),$(wildcard fixtures/native_binding/bindings.bin))
 fixture_test = $(if $(HAVE_BINDING_FIXTURES),./$(1) $(BINDING_FIXTURES),@echo "跳过 $(1)：没有夹具 $(BINDING_FIXTURES)（公开仓库不带，要自己从运行中的游戏抓，见 fixtures/native_binding/README）")
 
-.PHONY: all run test clean
+.PHONY: all run test clean profile-metadata
 all: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET) $(GPU_PROBE_TARGET) $(GPU_CHECKPOINT_TARGET) $(GPU_MEMORY_TARGET)
 run: test
+profile-metadata:
+	$(PYTHON) test_profile_metadata.py
 $(TARGET): t_touch_controls.c $(wildcard ../Sources/dm_touch_controls.[ch]) ../../host/dm_input.h
 	$(CC) $(CFLAGS) -I../Sources t_touch_controls.c ../Sources/dm_touch_controls.c -lm -o $@
 t_native_binding: t_native_binding.c ../Sources/dm_touch_game_state.c ../Sources/dm_touch_game_state.h ../Sources/dm_touch_controls.c ../Sources/dm_touch_controls.h
@@ -60,6 +63,7 @@ test: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL
 	$(GPU_MEMORY_TARGET)
 	python3 test_simulator.py
 	python3 test_pso_native.py
+	$(PYTHON) test_profile_metadata.py
 	./$(METAL_CACHE_TARGET)
 	./$(TARGET)
 	./t_skill_aim
