@@ -19,7 +19,7 @@ import sys
 import time
 
 sys.dont_write_bytecode = True
-from shaders import PROFILE, sha, stage
+from shaders import sha
 from inputs import validate_donor
 import snapshot
 
@@ -159,6 +159,10 @@ def build(args):
         raise ValueError('--out must be within this repository .tmp directory')
     original_inputs = {name: getattr(args, name).resolve() for name in
                        ('modules', 'app_resources', 'tables', 'shader_cache', 'shader_manifest', 'shader_metadata')}
+    for name in ('shader_profile', 'profile_metadata'):
+        value = getattr(args, name)
+        if value is not None:
+            original_inputs[name] = value.resolve()
     for path in original_inputs.values():
         if root.is_relative_to(path) or path.is_relative_to(root):
             raise ValueError('output overlaps a declared input')
@@ -174,9 +178,13 @@ def build(args):
         tool_paths.append(Path(subprocess.check_output(['xcrun', '--sdk', 'iphonesimulator', '--find', name],
                                                      env=env, text=True).strip()).resolve())
     tool_inputs = {str(path): sha(path) for path in tool_paths}
+    if args.shader_mode == 'derived-profile':
+        tool_inputs[str(Path(args.validation_python).resolve())] = sha(Path(args.validation_python).resolve())
     source_root = root / 'inputs/source'
     source_proof = snapshot.source(REPO, source_root)
     dm, ios = source_root / 'dm', source_root / 'dm/ios'
+    frozen_profiles = module('simulator_frozen_profile_inputs', ios / 'tools/simulator/profile_inputs.py')
+    frozen_profiles.selected_inputs(args)
     groups = {}
     selected = {}
     for name, source in original_inputs.items():
@@ -188,8 +196,12 @@ def build(args):
                        for s in ('.patched.bin', '.fixups.tsv', '.gates.tsv')]
         elif name == 'tables':
             entries = [(n, source / n) for n in ('dm_hud_exp.h', 'dm_vault_tab.h', 'dm_bright_levels.inc')]
-        elif name == 'shader_metadata':
+        elif name in {'shader_metadata', 'profile_metadata'}:
             entries = [(n, source / n) for n in ('shader_map.tsv', 'pso_manifest.tsv', 'c1_full.tsv')]
+            if name == 'profile_metadata':
+                if set(p.name for p in source.iterdir()) != frozen_profiles.METADATA_FILES:
+                    raise ValueError('profile metadata must contain exactly four files')
+                entries.append(('metadata-profile.json', source / 'metadata-profile.json'))
         elif name == 'app_resources':
             excluded = {'DmIOS', 'Info.plist', 'PkgInfo', 'Frameworks', '_CodeSignature',
                         'embedded.mobileprovision', 'Assets.car', 'msl', 'save_ref', 'save_ref_warlock',
@@ -231,27 +243,44 @@ def build(args):
         else:
             shutil.copyfile(path, dst)
             source_inputs[str(path)] = sha(path)
+    frozen_shaders = module('simulator_frozen_shaders', ios / 'tools/simulator/shaders.py')
+    admission = None
     metadata = args.shader_metadata
     for module_name in ('main', 'sdk'):
         for suffix in ('.fixups.tsv', '.gates.tsv'):
             name = module_name + suffix
             resource_bindings['dm/' + name] = groups['modules']['files'][name]
             shutil.copyfile(args.modules / name, root / 'resources/dm' / name)
-    expected = {line.split('\t')[3] for line in (metadata / 'shader_map.tsv').read_text().splitlines()
-                if line and not line.startswith(('#', 'package\t'))}
-    fetch = module('simulator_dmsh_fetch', dm / 'gfx/tools/dmsh_fetch.py')
-    bf_want = {line.strip() for line in (dm / 'gfx/nvn/bf_want.tsv').read_text().splitlines()
-               if line.strip() and not line.lstrip().startswith('#')}
-    chain = json.loads(args.shader_manifest.read_text())['chain']
-    shader_proof = stage(args.shader_cache, args.shader_manifest, root / 'resources/msl' / ('b-' + chain),
-                         fetch.variant, bf_want, expected)
+    if args.shader_mode == 'derived-profile':
+        admission = frozen_profiles.admit(
+            source_root, args.shader_cache, args.shader_manifest, args.shader_metadata,
+            args.shader_profile, args.profile_metadata, args.metadata_descriptor_sha256,
+            args.validation_python, root / 'profile-admission', args.developer_dir,
+            lambda argv, cwd: run(argv, root, env, 'profile-admission', cwd=cwd))
+        metadata = args.profile_metadata
+        chain = admission['chain']
+        shader_proof = frozen_shaders.stage_profile(args.shader_profile, admission,
+                                                    root / 'resources/msl' / ('b-' + chain))
+    else:
+        expected = {line.split('\t')[3] for line in (metadata / 'shader_map.tsv').read_text().splitlines()
+                    if line and not line.startswith(('#', 'package\t'))}
+        fetch = module('simulator_dmsh_fetch', dm / 'gfx/tools/dmsh_fetch.py')
+        bf_want = {line.strip() for line in (dm / 'gfx/nvn/bf_want.tsv').read_text().splitlines()
+                   if line.strip() and not line.lstrip().startswith('#')}
+        chain = json.loads(args.shader_manifest.read_text())['chain']
+        shader_proof = frozen_shaders.stage(args.shader_cache, args.shader_manifest, root / 'resources/msl' / ('b-' + chain),
+                                            fetch.variant, bf_want, expected)
     for name in shader_proof['identities']:
         if name.endswith(('.json', '.metallib')) and name != '_b_build.json':
-            resource_bindings['msl/b-' + chain + '/' + name] = groups['shader_cache']['files'][name]
-    for name in ('shader_map.tsv', 'pso_manifest.tsv', 'c1_full.tsv'):
-        resource_bindings['dm/' + name] = groups['shader_metadata']['files'][name]
-        source_inputs[str(metadata / name)] = sha(metadata / name)
-        shutil.copyfile(metadata / name, root / 'resources/dm' / name)
+            identity = (groups['shader_profile']['files']['b-' + chain + '/' + name] if admission is not None
+                        else groups['shader_cache']['files'][name])
+            resource_bindings['msl/b-' + chain + '/' + name] = identity
+    metadata_stage = frozen_profiles.stage_metadata(
+        metadata, groups['profile_metadata' if admission is not None else 'shader_metadata']['files'],
+        root / 'resources/dm', profile=args.shader_profile if admission is not None else None,
+        profile_identity=groups['shader_profile']['files']['profile.json'] if admission is not None else None)
+    resource_bindings.update(metadata_stage['resources'])
+    source_inputs.update(metadata_stage['sources'])
     if not (metadata / 'c1_full.tsv').read_text().startswith('# chain b-' + chain + ' '):
         raise ValueError('C1 metadata does not match the source shader chain')
     art_proof = native_art(app, root / 'Gen/native/dm_touch_native_art.c', ios)
@@ -262,7 +291,7 @@ def build(args):
     config = config.replace('HEADER_SEARCH_PATHS = $(inherited) ',
                             'HEADER_SEARCH_PATHS = $(inherited) "' + str(root / 'Gen/include') + '" ', 1)
     config += 'OTHER_LDFLAGS = $(inherited) $(DM_FRAMEWORKS)\n'
-    profile = '#define DM_SHELL 1\n#define DM_NVN_M3 1\n#define DM_SIMULATOR_SHADER_CHAIN "' + chain + '"\n'
+    profile = frozen_profiles.constants(chain, admission)
     for name, content in (('dm.xcconfig', config), ('profile.h', profile)):
         data = content.encode()
         generated_bindings[name] = dict(size=len(data), sha256=hashlib.sha256(data).hexdigest())
@@ -324,7 +353,7 @@ def build(args):
     for name, digest in project_inputs.items():
         if sha(root / name) != digest:
             raise ValueError('generated project input changed: ' + name)
-    manifest = dict(schema='d2r.ios-simulator-build.v2', state='built_unexecuted', profile=PROFILE,
+    manifest = dict(schema='d2r.ios-simulator-build.v3', state='built_unexecuted', profile=shader_proof['profile'],
                     source_revision=source_proof['revision'], source_diff_sha256=source_proof['diff_sha256'],
                     source_snapshot=source_proof, input_snapshots=groups, staged_inputs=staged_proof,
                     tool_inputs=tool_inputs, project_inputs=project_inputs,
@@ -332,10 +361,11 @@ def build(args):
                     final_app_inventory=final_app_inventory, final_bundled_modules=final_donor_proof,
                     source_inputs=source_inputs, app=str(result), app_identity=app_proof,
                     generated_guest_identity=framework_proof, guest_identity=signed_guest_proof,
-                    shaders=shader_proof, native_art=art_proof, donor=donor_proof,
+                    shaders=shader_proof, shader_mode=args.shader_mode, profile_admission=admission,
+                    renderer_profile_activated=False, native_art=art_proof, donor=donor_proof,
                     simulator_device_created=False, guest_executed=False)
     (root / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-    print(json.dumps(dict(app=str(result), profile=PROFILE, state='built_unexecuted')), flush=True)
+    print(json.dumps(dict(app=str(result), profile=shader_proof['profile'], state='built_unexecuted')), flush=True)
     return manifest
 
 
@@ -343,6 +373,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('modules', 'app-resources', 'tables', 'shader-cache', 'shader-manifest', 'shader-metadata', 'out'):
         parser.add_argument('--' + name, required=True, type=Path)
+    parser.add_argument('--shader-mode', required=True, choices=('canonical', 'derived-profile'))
+    for name in ('shader-profile', 'profile-metadata', 'validation-python'):
+        parser.add_argument('--' + name, type=Path)
+    parser.add_argument('--metadata-descriptor-sha256')
     parser.add_argument('--developer-dir', type=Path, default=Path('/Applications/Xcode.app/Contents/Developer'))
     parser.add_argument('--bundle-id', default='org.d2rmobile.simulator')
     parser.add_argument('--jobs', type=int, default=4)

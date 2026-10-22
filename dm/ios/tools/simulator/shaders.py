@@ -8,6 +8,7 @@ import shutil
 
 
 PROFILE = 'ios-simulator-arm64-m3-source-v1'
+DERIVED_PROFILE = 'ios-simulator-arm64-derived-source-v1'
 KEY = re.compile(r'[0-9a-f]{16}')
 CHAIN = re.compile(r'[0-9a-f]{12}')
 
@@ -91,3 +92,41 @@ def stage(cache, manifest, destination, fetch_variant, bf_want, expected_keys):
             if sha(destination / name) != proof['identities'][name]:
                 raise ValueError('staged source shader identity mismatch: ' + name)
     return proof
+
+
+def stage_profile(profile, admission, destination):
+    """Stage only the exact base artifacts admitted by frozen CPU validation."""
+    profile, destination = Path(profile), Path(destination)
+    chain = admission['chain']
+    if not CHAIN.fullmatch(chain) or any(admission[name] is not False for name in
+                                       ('compiled', 'executed', 'renderer_qualified')):
+        raise ValueError('invalid source-only profile admission')
+    prefix = 'b-' + chain + '/'
+    files = admission['staged_files']
+    if not files or len(files) != admission['keys'] * 2:
+        raise ValueError('incomplete derived source staging set')
+    names = {}
+    for name, value in files.items():
+        if not name.startswith(prefix) or not re.fullmatch(r'[0-9a-f]{16}_b\.(json|metallib)', name[len(prefix):]):
+            raise ValueError('derived staging includes unsupported/BF artifacts')
+        path = profile / name
+        if path.is_symlink() or not path.is_file() or path.stat().st_size != value['size'] or sha(path) != value['sha256']:
+            raise ValueError('derived source changed before staging')
+        names[name[len(prefix):]] = value
+    keys = {name[:-len('_b.json')] for name in names if name.endswith('_b.json')}
+    if len(keys) != admission['keys'] or set(names) != {key + '_b' + suffix for key in keys for suffix in ('.json', '.metallib')}:
+        raise ValueError('derived stage key/pair coverage mismatch')
+    destination.mkdir(parents=True, exist_ok=False)
+    for name, value in names.items():
+        shutil.copyfile(profile / prefix / name, destination / name)
+    if {p.name for p in destination.iterdir()} != set(names):
+        raise ValueError('derived staged artifact set changed')
+    for name, value in names.items():
+        for path in (profile / prefix / name, destination / name):
+            if path.is_symlink() or path.stat().st_size != value['size'] or sha(path) != value['sha256']:
+                raise ValueError('derived source/staged identity mismatch: ' + name)
+    return dict(profile=DERIVED_PROFILE, source_profile=admission['source_profile'], chain=chain,
+                keys=len(keys), libraries=len(keys), variants=0,
+                identities={name: value['sha256'] for name, value in names.items()},
+                metadata_sha256=admission['metadata_sha256'], metadata_id=admission['metadata_id'],
+                compiled=False, executed=False, renderer_qualified=False)
