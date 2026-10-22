@@ -16,20 +16,22 @@ Block linear is how the Tegra X1 GPU stores textures: the data is not one row af
 |---|---|
 | `nvn_fmt_mtl.h`, `nvn_fmt_mtl.c` | `nvn_fmt_to_mtl()`: NVN format (0x01–0x9C) → Metal pixel format + component remapping. Returns 1 for an exact match, 2 for a substitute (precision, bit order or interpretation differs and a conversion is needed), 0 when Metal has no corresponding format. How each format is handled is written in the comments inside the table. Pure C, no dependency on Metal headers |
 | `nvn_deswizzle.h`, `nvn_deswizzle.c` | `nvn_deswizzle()`: deswizzles one level and one layer from block linear to linear; `nvn_swizzle()`: the reverse, used for round trips in unit tests; `nvn_bl_offset()`: the block-linear address of a single point. Pure C |
-| `nvn_deswizzle_gpu.h`, `nvn_deswizzle_gpu.m` | A Metal compute shader version of the same deswizzling algorithm, used by the replay layer when uploading packaged textures; when initialization fails or an unsupported format is encountered, the replay layer falls back to the CPU version |
+| `nvn_deswizzle_gpu.h`, `nvn_deswizzle_gpu.m` | A Metal compute shader version of the same deswizzling algorithm, used by the physical replay path for packaged uploads; that path falls back to CPU on initialization/format failure. Opt-in simulator BC transfers require the GPU deswizzler and never snapshot potentially GPU-written Guest bytes |
 | `nvn_bcdec.h`, `nvn_bcdec.c` | `nvn_bc_unpacked()` / `nvn_bc_decode()`: decompress BC textures on the CPU into uncompressed formats; decoding uses `dm/third_party/bcdec` |
+| `nvn_bc_vectors.h` | Independent constant-endpoint synthetic fixtures shared by CPU and host-only GPU diagnostics for all 16 NVN BC formats |
 | `tests/` | Unit tests |
 
 The offsets of each level and layer within the storage, and the block height and block depth actually used by each level, are all taken from `../nvn/nvn_tex.c` (`nvn_tex_layout`, `nvn_tex_level_offset`, `nvn_tex_level_tiles`); this directory only does addressing and moving within a level. The game's packaged textures carry their own layout parameters, whose byte 0 is the log2 of the level 0 block height; when it is present it takes precedence (the `pkg_block_h` field of `nvn_texdesc`).
 
-## Devices without BC support
+## Devices without BC support and simulator transfers
 
-Some older Apple GPUs do not support BC compressed textures (determined by `supportsBCTextureCompression` of `MTLDevice`). On these devices:
+Older physical devices select substitute formats through `MTLDevice.supportsBCTextureCompression`. An optional supplementary pack can convert game textures to ASTC offline (`dm/tools/astc_pack.py`; dependencies are in `docs/DEPENDENCIES.md`); the replay layer creates the remaining BC textures in decoded formats. CPU decoding uses this directory's `nvn_bcdec.c`. Physical backend selection and upload orchestration remain unchanged, and `DM_TEST_NO_BC=1` forces that path.
 
-- the game's textures can be converted to ASTC format offline in advance with an optional supplementary pack (`dm/tools/astc_pack.py`; for dependencies see the "Optional" section of `docs/DEPENDENCIES.md`);
-- the remaining BC textures are created by the replay layer in their decompressed format and decompressed at upload; decompression on the CPU goes through `nvn_bcdec.c` in this directory.
+The opt-in `DM_NVN_SIMULATOR=1` path is orchestrated by the adjacent `nvn/nvn_bc_transfer.h/.m`. Complete regions and staging budgets are checked before encoding; staging is allocated only after the producer event. Separate readback/upload queues obtain owned bytes from GPU linear-block copies or GPU deswizzling, then CPU-decode and upload with raw-byte blits, including sRGB substitutes. Source references are dropped after readback, and successful upload retires staging references/charges before publishing the consumer event. It does not snapshot potentially GPU-written sources or write expanded pixels into compressed-size destinations.
 
-The environment variable `DM_TEST_NO_BC=1` forces this path on any machine.
+CPU ordering, padded rows, edge/signed formats, budgets and failure controls pass. The host-only `bc-transfers` case has not been built or run. Compressed raw-shadow storage, T2B/ReadTexels, format/view reinterpretation and ASTC bridges fail explicitly; GPU-write invalidation of the existing packaged cache remains unproved. Simulator profile/game guards remain inactive until actual GPU/format/renderer/world acceptance is complete.
+
+The shared bcdec header has one defined-arithmetic correction: masked unsigned endpoint sign extension avoids the original BC6H signed-left-shift overflow. This also applies to the physical CPU fallback; decoder algorithms and API remain the same. Source, modification and license are documented in `dm/third_party/bcdec/README.md`.
 
 ## Tests
 
@@ -37,6 +39,8 @@ The environment variable `DM_TEST_NO_BC=1` forces this path on any machine.
 make -C dm/gfx/tex/tests samples   # fetch real-data samples (see below)
 make -C dm/gfx/tex/tests run       # run t_fmt_mtl and t_tex
 ```
+
+`make -C dm/gfx/tests simulator-bindings` also runs a CPU-only BC transfer recorder, 32 independent endpoint/edge/canary vectors and the sign-extension arithmetic oracle. The oracle covers all 131,070 bit patterns at widths 1–16 plus 96 extreme inputs; restoring the original expression triggers UBSan in the mutation control. The existing real-data tests below remain separate.
 
 - **`t_fmt_mtl`**: takes the mapping for every NVN format in 0x01–0x9C and, for every one whose mapping is not 0, actually creates a texture on the local Metal device; all of them must be created successfully. It also checks that every NVN format with sRGB in its name lands on a Metal sRGB format. No game files needed.
 - **`t_tex`**: the deswizzling tests, in several groups:

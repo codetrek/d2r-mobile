@@ -22,6 +22,7 @@
 #include "nvn_ordered_constants.h"
 #include "nvn_depth_dummy.h"
 #include "nvn_prepared_arguments.h"
+#include "nvn_bc_transfer.h"
 // 编译期开关 DM_NVN_M3=1：图形后端走老接口（普通命令队列 / 命令缓冲 / 渲染与计算与拷贝编码器，逐槽绑定缓冲，对参数块引用的资源逐个声明），
 // 目标 macOS 15 / iOS 18。缺省 0 = Metal 4（macOS 26 / iOS 26）。两支共用同一份回放逻辑，分叉处都在 #if DM_NVN_M3 里
 // Compile-time switch DM_NVN_M3=1: the graphics backend uses the older API (ordinary command queue / command buffers / render, compute and copy encoders, buffers bound per slot, each resource referenced by an argument block declared individually),
@@ -1197,10 +1198,17 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
         case 10: RED_ONCE(1, "缓冲贴图（TARGET_BUFFER）未实现"); return nil;
         default: d.textureType = MTLTextureType2D; break;
     }
+#if DM_NVN_SIMULATOR
+    if (unp && (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE)) MDIE("Simulator BC image writes require a compressed-storage implementation");
+    d.hazardTrackingMode = MTLHazardTrackingModeTracked;
+#endif
     d.storageMode = MTLStorageModePrivate;   // 渲染目标与素材都放 GPU 私有存储（可用无损压缩） | Render targets and assets both go in GPU private storage (lossless compression available)
     d.usage = MTLTextureUsageShaderRead | (fmt_compressed(t->d.format) || packaged ? 0 : MTLTextureUsageRenderTarget)
             | (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE ? MTLTextureUsageShaderWrite : 0)   // 图像用途：着色器可写（计算核生成 3D 调色表等） | Image usage: shader-writable (compute kernels generating the 3D color lookup table, etc.)
             | (unp ? MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView : 0);   // 无 BC：解压格式贴图由 GPU 解压核写（up_dec）/ 接 ASTC 源的整块拷贝（copy_t2t_astc） | No BC: textures in the decompressed format are written by the GPU decompression kernel (up_dec) / receive whole-block copies from ASTC sources (copy_t2t_astc)
+#if DM_NVN_SIMULATOR
+    if (unp) d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+#endif
     return d;
 }
 // 就地升级：原贴图没开 PixelFormatView（缺省不开，保住苹果显卡无损压缩）却要建换格式视图时，按原规格 + PixelFormatView 新建、逐 slice × level 拷过去并替换登记。
@@ -1467,6 +1475,44 @@ static void up_blit_add(id<MTLBuffer> src, size_t off, size_t row, size_t image,
     g_up_blits[g_nup_blits++] = (up_blit){src, off, row, image, size, dst, slice, level};
 }
 
+#if DM_NVN_SIMULATOR
+static NvnBCTransfers *g_sim_bc_transfers;
+static void sim_bc_enqueue(id<MTLBuffer> source, NSUInteger offset, NSUInteger length, uint32_t format,
+                           const NvnBCRegion *regions, NSUInteger count, const nvn_texdesc *packaged, id<MTLTexture> destination) {
+    rp_end();
+    if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    if (!g_cb || (packaged && !g_nvn_deswz_gpu)) MDIE("Simulator BC transfer requires an active owner submission and GPU deswizzler");
+    if (!g_sim_bc_transfers) {
+        id<MTLCommandQueue> reader = [g_dev newCommandQueue], uploader = [g_dev newCommandQueue];
+        g_sim_bc_transfers = [[NvnBCTransfers alloc] initWithDevice:g_dev readbackQueue:reader uploadQueue:uploader
+                                                       byteBudget:256u*1024u*1024u jobBudget:4096];
+        if (!g_sim_bc_transfers) MDIE("Simulator BC transfer queue initialization failed");
+    }
+    NvnBCStatus status = [g_sim_bc_transfers encodeCommand:g_cb source:source offset:offset length:length format:format
+                                                 regions:regions count:count packaged:packaged destination:destination];
+    if (status) MDIE("Simulator BC transfer admission failed (%d)", status);
+}
+static void sim_bc_package(const tex_t *t, id<MTLTexture> destination) {
+    void *buffer; uint64_t offset;
+    if (!mtl_addr((uint64_t)t->mem,t->L.size,&buffer,&offset)) MDIE("Simulator BC packaged source has no complete owned pool span");
+    NSUInteger layers=t->L.layers, levels=destination.mipmapLevelCount;
+    if (!layers || !levels || levels>15 || layers>4096/levels) MDIE("Simulator BC packaged region count is unsupported");
+    NvnBCRegion *regions=calloc(layers*levels,sizeof *regions);
+    if (!regions) MDIE("Simulator BC packaged region allocation failed");
+    NSUInteger count=0;
+    for (unsigned level=0;level<levels;level++) for (unsigned layer=0;layer<layers;layer++) {
+        uint32_t width=MAX(t->d.width>>level,1u),height=(t->d.target==0 || t->d.target==3)?1:MAX(t->d.height>>level,1u);
+        uint32_t depth=t->d.target==2?MAX(t->d.depth>>level,1u):1;
+        int bw,bh,block=nvn_fmt_bpb(t->d.format,&bw,&bh);
+        NSUInteger row=((NSUInteger)width+3)/4*block,image=row*((height+3)/4);
+        regions[count++]=(NvnBCRegion){.width=width,.height=height,.depth=depth,.sourceRow=row,.sourceImage=image,
+            .level=level,.slice=t->d.target==2?0:layer,.sourceLevel=level,.sourceLayer=layer};
+    }
+    sim_bc_enqueue((__bridge id<MTLBuffer>)buffer,offset,t->L.size,t->d.format,regions,count,&t->d,destination);
+    free(regions);
+}
+#endif
+
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp);
 static id<MTLTexture> pkg_upload(const tex_t *t, uint64_t *stamp) {
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
@@ -1492,6 +1538,12 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
     unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;
     if (t->d.target == 9) layers *= 6;
     uint32_t upf; int ubpp = 0, unp = bc_unpack(t->d.format, &upf, &ubpp);   // 无 BC：解排布后在 CPU 上解压，暂存区按解压后的大小 | No BC: decompress on the CPU after deswizzling, with the staging area sized for the decompressed data
+#if DM_NVN_SIMULATOR
+    if (unp) {
+        sim_bc_package(t,mt);
+        return mt;
+    }
+#endif
     size_t total = 0;
     for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
         uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
@@ -2734,6 +2786,11 @@ static id<MTLTexture> tex_by_id(int tid) {   // 调用方持 g_rmu | Caller hold
     if (!base) return nil;
     v = base;
     if (r.has_v && (r.v.set_format || r.v.set_levels || r.v.set_layers || r.v.set_target)) {
+#if DM_NVN_SIMULATOR
+        uint32_t unpacked; int pixelBytes;
+        if (r.v.set_format && r.v.format!=r.t.d.format && nvn_bc_unpacked(r.t.d.format,&unpacked,&pixelBytes))
+            MDIE("Simulator BC view reinterpretation requires preserved compressed storage");
+#endif
         uint32_t pf = (uint32_t)base.pixelFormat; uint8_t swz[4];
         if (r.v.set_format && !(nvn_fmt_to_mtl(r.v.format, &pf, swz) && pf)) pf = (uint32_t)base.pixelFormat;
         { uint32_t upf; int ubpp; if (r.v.set_format && bc_unpack(r.v.format, &upf, &ubpp)) pf = upf; }   // 无 BC：BC 视图跟底图一样换成解压后的格式 | No BC: a BC view is switched to the decompressed format just like the base texture
@@ -5561,6 +5618,11 @@ static void dispatch(const p_dispatch *dp) {
 // GPU：贴图 → 缓冲（行距取 SetCopyRowStride，0 = 紧排）
 // GPU: texture -> buffer (row stride taken from SetCopyRowStride, 0 = tightly packed)
 static void copy_t2b(const p_copy_b2t *c) {
+#if DM_NVN_SIMULATOR
+    uint32_t unpacked; int pixelBytes;
+    if (c->tex && nvn_bc_unpacked(c->tex->d.format,&unpacked,&pixelBytes))
+        MDIE("Simulator BC texture-to-buffer requires preserved compressed storage; expanded pixels cannot replace block bytes");
+#endif
     if (c->tex) xv_check(c->tex->serial, c->has_view && c->view.set_levels ? c->view.base_level : 0, c->has_view && c->view.set_layers ? c->view.min_layer : 0, "贴图读缓冲");
     id<MTLTexture> t = tex_mtl(c->tex);
     if (!t) return;
@@ -5584,6 +5646,11 @@ static void copy_t2b(const p_copy_b2t *c) {
 // CPU 读贴图（ReadTexels）：预排布贴图以池内存为真值，解排布直读；其余从 MTLTexture blit 读回（调用方已按 NVN 规矩等过 GPU）
 // CPU texture read (ReadTexels): for packaged textures the pool memory is the ground truth, de-layout and read directly; the rest are read back from the MTLTexture by blit (the caller has already waited for the GPU per NVN rules)
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
+#if DM_NVN_SIMULATOR
+    uint32_t unpacked; int pixelBytes;
+    if (nvn_bc_unpacked(t->d.format,&unpacked,&pixelBytes))
+        MDIE("Simulator BC ReadTexels requires an ordered compressed-storage readback");
+#endif
     if (!on_sub_thread()) while (atomic_load(&g_up_pending)) usleep(200);   // 翻译在翻译线程：调用方已排空队列（批已随提交冲刷），这里只等上传在 GPU 上做完（提交线程上由 q_cb 冲刷并等） | Translation runs on the translation thread: the caller has already drained the queue (batches were flushed with the submit), so here we only wait for uploads to finish on the GPU (on the submit thread q_cb flushes and waits)
     xv_check(t->serial, level, layer0, "CPU读回");
     PD("U cpu_read ser=%llu lv%u sl%u xyz=%d,%d,%d size=%d,%d,%d dst=%p row=%lu img=%lu", t->serial, level, layer0, r->xoffset, r->yoffset, r->zoffset, r->width, r->height, r->depth, dst, (unsigned long)row, (unsigned long)img);
@@ -5630,6 +5697,16 @@ static void copy_b2t(const p_copy_b2t *c) {
     void *mb; uint64_t mo;
     if (!mtl_addr(c->src, extent, &mb, &mo)) { RED_ONCE(23, "缓冲→贴图拷贝的源不在内存池里"); return; }
     uint32_t upf; int ubpp;
+#if DM_NVN_SIMULATOR
+    if (bc_unpack(c->tex->d.format,&upf,&ubpp)) {
+        if (c->has_view && c->view.set_format && c->view.format!=c->tex->d.format) MDIE("Simulator BC copy view reinterpretation is unsupported");
+        NvnBCRegion region={.width=c->r.width,.height=c->r.height,.depth=nz,.sourceRow=row,.sourceImage=img,
+            .level=level,.slice=is3d?0:layer0+c->r.zoffset,
+            .origin=MTLOriginMake(c->r.xoffset,c->r.yoffset,is3d?c->r.zoffset:0)};
+        sim_bc_enqueue((__bridge id<MTLBuffer>)mb,mo,extent,c->tex->d.format,&region,1,NULL,t);
+        return;
+    }
+#endif
     if (bc_unpack(c->tex->d.format, &upf, &ubpp)) {   // 无 BC：源里的压缩块在 CPU 上解压进临时缓冲，再按像素拷进解压格式的贴图 | No BC: the compressed blocks in the source are decompressed on the CPU into a temporary buffer, then copied pixel-wise into the decompressed-format texture
         const uint8_t *src = [(__bridge id<MTLBuffer>)mb contents];
         if (!src) { RED_ONCE(46, "无 BC 解压：缓冲→贴图拷贝的源缓冲 CPU 读不到"); return; }
@@ -5712,6 +5789,14 @@ static void copy_t2t(const p_copy_t2t *c) {
     PD("t src=%llu lv%u sl%u xyz=%d,%d,%d dst=%llu lv%u sl%u xyz=%d,%d,%d size=%d,%d,%d", c->src->serial, sl, sz0, c->sr.xoffset, c->sr.yoffset, c->sr.zoffset,
        c->dst->serial, dl, dz0, c->dr.xoffset, c->dr.yoffset, c->dr.zoffset, c->sr.width, c->sr.height, c->sr.depth);
     int s3 = c->src->d.target == 2, d3 = c->dst->d.target == 2, nz = c->sr.depth ? c->sr.depth : 1;
+#if DM_NVN_SIMULATOR
+    uint32_t unpacked; int pixelBytes;
+    if (nvn_bc_unpacked(c->src->d.format,&unpacked,&pixelBytes) || nvn_bc_unpacked(c->dst->d.format,&unpacked,&pixelBytes)) {
+        if (c->src->d.format!=c->dst->d.format || (c->has_sv && c->sv.set_format && c->sv.format!=c->src->d.format) ||
+            (c->has_dv && c->dv.set_format && c->dv.format!=c->dst->d.format))
+            MDIE("Simulator BC format reinterpretation/ASTC bridge requires preserved block storage or a separately qualified conversion");
+    }
+#endif
     if (no_bc() && (s.pixelFormat == MTLPixelFormatASTC_4x4_LDR || s.pixelFormat == MTLPixelFormatASTC_4x4_sRGB) && (d.pixelFormat == MTLPixelFormatRGBA8Unorm || d.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB)
         && !s3 && !d3 && c->sr.width == c->dr.width && c->sr.height == c->dr.height && (d.usage & MTLTextureUsageShaderWrite)) {   // 无 BC：ASTC 源 → 解压格式目标（见 copy_t2t_astc） | No BC: ASTC source -> decompressed-format destination (see copy_t2t_astc)
         int ok = 1;

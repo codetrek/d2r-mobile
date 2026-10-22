@@ -464,9 +464,12 @@ BCDECDEF void bcdec_bc5_float(const void* compressedBlock, void* decompressedBlo
 }
 #endif /* BCDEC_BC4BC5_PRECISE */
 
-/* http://graphics.stanford.edu/~seander/bithacks.html#VariableSignExtend */
+/* Masked sign extension avoids signed left-shift overflow for BC6H endpoints.
+   https://graphics.stanford.edu/~seander/bithacks.html#VariableSignExtend */
 static int bcdec__extend_sign(int val, int bits) {
-    return (val << (32 - bits)) >> (32 - bits);
+    unsigned int sign = 1u << (bits - 1);
+    unsigned int value = (unsigned int)val & ((sign << 1) - 1u);
+    return (int)(value ^ sign) - (int)sign;
 }
 
 static int bcdec__transform_inverse(int val, int a0, int bits, int isSigned) {

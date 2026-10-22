@@ -13,6 +13,9 @@ ORDERED_CONSTANT_TEST=../../../.tmp/gfx-tests/t_ordered_constants
 CONSTANT_ORCHESTRATION_TEST=../../../.tmp/gfx-tests/t_constant_orchestration
 DEPTH_DUMMY_TEST=../../../.tmp/gfx-tests/t_depth_dummy
 PREPARED_ARGUMENTS_TEST=../../../.tmp/gfx-tests/t_prepared_arguments
+BC_TRANSFER_TEST=../../../.tmp/gfx-tests/t_bc_transfer
+BC_VECTOR_TEST=../../../.tmp/gfx-tests/t_bc_vectors
+BC_SIGN_TEST=../../../.tmp/gfx-tests/t_bc_sign
 PSO_PROFILE_TEST=../../../.tmp/gfx-tests/t_pso_profile
 CONSTANT_PREPARATION_EXTRACT=../../../.tmp/gfx-tests/constant_preparation.inc
 # 宿主 crash.c 一并链入：写保护单测走生产同一套缺页钩子
@@ -95,7 +98,16 @@ $(DEPTH_DUMMY_TEST): t_depth_dummy.m ../nvn/nvn_depth_dummy.h ../nvn/nvn_depth_d
 $(PREPARED_ARGUMENTS_TEST): t_prepared_arguments.m ../nvn/nvn_prepared_arguments.h ../nvn/nvn_prepared_arguments.m ../nvn/nvn_simulator.h
 	mkdir -p $(@D)
 	clang -O2 -g -Wall -Wextra -Werror -fobjc-arc -o $@ $< ../nvn/nvn_prepared_arguments.m -framework Foundation -framework Metal
-simulator-bindings: $(SIMULATOR_BINDING_TEST) $(NATIVE_ARGUMENT_TEST) $(BUFFER_IDENTITY_TEST) $(ORDERED_CONSTANT_TEST) $(CONSTANT_ORCHESTRATION_TEST) $(DEPTH_DUMMY_TEST) $(PREPARED_ARGUMENTS_TEST)
+$(BC_TRANSFER_TEST): t_bc_transfer.m ../nvn/nvn_bc_transfer.h ../nvn/nvn_bc_transfer.m ../tex/nvn_bcdec.h ../tex/nvn_bcdec.c ../tex/nvn_deswizzle.h ../tex/nvn_deswizzle.c ../nvn/nvn_tex.c ../../third_party/bcdec/bcdec.h
+	mkdir -p $(@D)
+	clang -O2 -g -Wall -Wextra -Werror -fobjc-arc -DDM_NVN_M3=1 -o $@ $< ../nvn/nvn_bc_transfer.m ../tex/nvn_bcdec.c ../tex/nvn_deswizzle.c ../nvn/nvn_tex.c -framework Foundation -framework Metal
+$(BC_VECTOR_TEST): t_bc_vectors.c ../tex/nvn_bc_vectors.h ../tex/nvn_bcdec.h ../tex/nvn_bcdec.c ../tex/nvn_fmt_mtl.h ../tex/nvn_fmt_mtl.c ../../third_party/bcdec/bcdec.h
+	mkdir -p $(@D)
+	clang -O2 -g -Wall -Wextra -Werror -o $@ $< ../tex/nvn_bcdec.c ../tex/nvn_fmt_mtl.c
+$(BC_SIGN_TEST): t_bc_sign.c ../../third_party/bcdec/bcdec.h
+	mkdir -p $(@D)
+	clang -O2 -g -Wall -Wextra -Werror -I../../third_party/bcdec -o $@ $<
+simulator-bindings: $(SIMULATOR_BINDING_TEST) $(NATIVE_ARGUMENT_TEST) $(BUFFER_IDENTITY_TEST) $(ORDERED_CONSTANT_TEST) $(CONSTANT_ORCHESTRATION_TEST) $(DEPTH_DUMMY_TEST) $(PREPARED_ARGUMENTS_TEST) $(BC_TRANSFER_TEST) $(BC_VECTOR_TEST) $(BC_SIGN_TEST)
 	$(SIMULATOR_BINDING_TEST)
 	$(NATIVE_ARGUMENT_TEST)
 	$(BUFFER_IDENTITY_TEST)
@@ -103,10 +115,16 @@ simulator-bindings: $(SIMULATOR_BINDING_TEST) $(NATIVE_ARGUMENT_TEST) $(BUFFER_I
 	$(CONSTANT_ORCHESTRATION_TEST)
 	$(DEPTH_DUMMY_TEST)
 	$(PREPARED_ARGUMENTS_TEST)
+	$(BC_TRANSFER_TEST)
+	$(BC_VECTOR_TEST)
+	$(BC_SIGN_TEST)
 .PHONY: simulator-bindings
 # 依赖一行一个、按字母序（免得加一个测试就整行冲突）；下面各条命令的先后不变
 # Dependencies one per line in alphabetical order (so that adding one test does not conflict on the whole line); the order of the commands below is unchanged
 run: \
+	$(BC_TRANSFER_TEST) \
+	$(BC_VECTOR_TEST) \
+	$(BC_SIGN_TEST) \
 	$(PSO_PROFILE_TEST) \
 	$(PREPARED_ARGUMENTS_TEST) \
 	$(DEPTH_DUMMY_TEST) \
@@ -140,6 +158,9 @@ run: \
 	t_ub \
 	t_xv \
 	t_zskip
+	$(BC_TRANSFER_TEST)
+	$(BC_VECTOR_TEST)
+	$(BC_SIGN_TEST)
 	./t_copy_pitch
 	$(PSO_PROFILE_TEST)
 	$(BUFFER_IDENTITY_TEST)

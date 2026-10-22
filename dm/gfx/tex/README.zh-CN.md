@@ -16,20 +16,22 @@ English: [README.md](README.md)
 |---|---|
 | `nvn_fmt_mtl.h`、`nvn_fmt_mtl.c` | `nvn_fmt_to_mtl()`：NVN 格式（0x01–0x9C）→ Metal 像素格式 + 分量重映射。返回 1 表示精确对应，2 表示替代（精度、位序或读法不同，需要转换），0 表示 Metal 没有对应格式。每个格式的处理办法写在表内注释里。纯 C，不依赖 Metal 头文件 |
 | `nvn_deswizzle.h`、`nvn_deswizzle.c` | `nvn_deswizzle()`：把某一级、某一层从块线性解到线性；`nvn_swizzle()`：反向，单测往返用；`nvn_bl_offset()`：单点的块线性地址。纯 C |
-| `nvn_deswizzle_gpu.h`、`nvn_deswizzle_gpu.m` | 同一个解排布算法的 Metal 计算着色器版本，回放层上传打包贴图时用；初始化失败或遇到不支持的格式时回放层退回 CPU 版 |
+| `nvn_deswizzle_gpu.h`、`nvn_deswizzle_gpu.m` | 同一个解排布算法的 Metal 计算着色器版本，真机回放层上传打包贴图时用；真机初始化失败或遇到不支持的格式时回放层退回 CPU 版。显式模拟器 BC 传输要求 GPU 解排布成功，不快照可能被 GPU 写入的 Guest 字节 |
 | `nvn_bcdec.h`、`nvn_bcdec.c` | `nvn_bc_unpacked()` / `nvn_bc_decode()`：BC 贴图在 CPU 上解压成不压缩格式，解码用 `dm/third_party/bcdec` |
+| `nvn_bc_vectors.h` | CPU 与 host-only GPU 诊断共用的独立固定端点合成数据，覆盖全部 16 种 NVN BC 格式 |
 | `tests/` | 单元测试 |
 
 各级、各层在存储里的偏移，以及每一级实际使用的块高、块深，一律取自 `../nvn/nvn_tex.c`（`nvn_tex_layout`、`nvn_tex_level_offset`、`nvn_tex_level_tiles`），这里只做级内的寻址与搬运。游戏的打包贴图自带布局参数，其第 0 字节是第 0 级块高的 log2，有它时以它为准（`nvn_texdesc` 的 `pkg_block_h` 字段）。
 
-## 不支持 BC 的设备
+## 不支持 BC 的设备与模拟器传输
 
-一部分较老的苹果显卡不支持 BC 压缩贴图（由 `MTLDevice` 的 `supportsBCTextureCompression` 判断）。在这些设备上：
+较老真机由 `MTLDevice.supportsBCTextureCompression` 决定是否使用替代格式。游戏贴图可用可选补充包离线换成 ASTC（`dm/tools/astc_pack.py`，依赖见 `docs/DEPENDENCIES.zh-CN.md`）；剩余 BC 由回放层创建为解压格式。CPU 解码使用本目录 `nvn_bcdec.c`，既有真机后端选择和上传编排不变；`DM_TEST_NO_BC=1` 可以强制这一路径。
 
-- 游戏贴图可以用可选的补充包事先离线换成 ASTC 格式（`dm/tools/astc_pack.py`，依赖见 `docs/DEPENDENCIES.zh-CN.md` 的「可选」一节）；
-- 剩下的 BC 贴图由回放层建成解压后的格式，上传时解压，CPU 上的解压走本目录的 `nvn_bcdec.c`。
+显式 `DM_NVN_SIMULATOR=1` 路径由相邻的 `nvn/nvn_bc_transfer.h/.m` 编排：完整区域和暂存预算在编码前检查，生产事件到达后才分配暂存；独立读取/上传队列将 GPU 线性块或 GPU 解排布的结果读入自有字节，CPU 解码后通过原始字节 blit 上传，包括 sRGB 替代格式。源引用在读回后释放，上传暂存引用和预算在成功完成后、发布消费事件前退役。它没有从潜在 GPU 写入源读取 CPU 快照，也不会将展开像素写进压缩大小的目标。
 
-环境变量 `DM_TEST_NO_BC=1` 可以在任何机器上强制走这条路径。
+该路径通过 CPU 编排、带填充行距/边缘/有符号格式及预算/失败检查；host-only `bc-transfers` 尚未构建或运行。压缩原字节影子存储、T2B/ReadTexels、格式/视图重解释和 ASTC 桥接明确失败，现有打包缓存对 GPU 写入的失效处理仍未证明。模拟器配置与游戏检查尚未启用，真实 GPU/格式/渲染/世界资格仍须完成。
+
+共享 bcdec 头文件有一项行为有定义的算术修正：用掩码后的无符号运算进行端点符号扩展，避免原有 BC6H 有符号左移溢出；此修正也应用于真机 CPU 解压。算法和 API 保持一致，来源、修改和许可证见 `dm/third_party/bcdec/README.md`。
 
 ## 测试
 
@@ -37,6 +39,8 @@ English: [README.md](README.md)
 make -C dm/gfx/tex/tests samples   # 取真数据样本（见下）
 make -C dm/gfx/tex/tests run       # 跑 t_fmt_mtl 与 t_tex
 ```
+
+`make -C dm/gfx/tests simulator-bindings` 另运行不创建 Metal 设备的 BC 传输记录器、32 组独立端点/边缘/保护数据检查及符号扩展算术判据。符号扩展覆盖 1–16 位全部 131,070 个模式和 96 个极值输入；恢复原表达式的负对照会触发 UBSan。下列原有真实数据测试保持独立。
 
 - **`t_fmt_mtl`**：对 0x01–0x9C 每个 NVN 格式取映射，凡映射不为 0 的，都在本机的 Metal 设备上真建一张贴图，必须全部建成；另核名字带 sRGB 的 NVN 格式都落到 Metal 的 sRGB 格式。不需要游戏文件。
 - **`t_tex`**：解排布的测试，分几组：

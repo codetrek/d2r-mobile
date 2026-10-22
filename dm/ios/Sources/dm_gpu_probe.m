@@ -15,6 +15,10 @@
 #include "../../gfx/nvn/nvn_ordered_constants.h"
 #include "../../gfx/nvn/nvn_depth_dummy.h"
 #include "../../gfx/nvn/nvn_prepared_arguments.h"
+#include "../../gfx/nvn/nvn_bc_transfer.h"
+#include "../../gfx/tex/nvn_bc_vectors.h"
+#include "../../gfx/tex/nvn_bcdec.h"
+#include "../../gfx/tex/nvn_deswizzle_gpu.h"
 #include "../../gfx/nvn/nvn_native_arguments.h"
 #include "dm_gpu_probe_checkpoint.h"
 
@@ -301,6 +305,153 @@ static NSDictionary *prepared_arguments(id<MTLDevice> device, id<MTLCommandQueue
     result[@"argument_encoded_length"] = @(encodedLength); result[@"argument_alignment"] = @(alignment);
     result[@"word_count"] = @128; result[@"output_match"] = @(match); result[@"surrounding_bytes_unchanged"] = @(guards);
     result[@"status"] = match && guards ? @"passed" : @"error"; result[@"stage"] = @"owned_readback"; return result;
+}
+
+static NSDictionary *bc_transfers(id<MTLDevice> device, id<MTLCommandQueue> queue, BOOL (^publish)(NSDictionary *)) {
+    NSMutableDictionary *result=[@{@"status":@"pending",@"stage":@"bc_compile_writer"} mutableCopy];
+    NSDictionary *(^failed)(NSString *,NSString *,NSError *)=^NSDictionary *(NSString *status,NSString *stage,NSError *error) {
+        [result addEntriesFromDictionary:failure(status,stage,error)];return result;
+    };
+    if (!publish(result)) return failed(@"error",@"result_persistence",nil);
+    NSError *error=nil;
+    NSString *source=@"#include <metal_stdlib>\nusing namespace metal;\n"
+        "kernel void copy_words(device const uint *seed [[buffer(0)]],device uint *out [[buffer(1)]],uint i [[thread_position_in_grid]]) { out[i]=seed[i]; }";
+    id<MTLLibrary> library=[device newLibraryWithSource:source options:nil error:&error];
+    id<MTLFunction> function=[library newFunctionWithName:@"copy_words"];
+    id<MTLComputePipelineState> writer=function?[device newComputePipelineStateWithFunction:function error:&error]:nil;
+    if (!writer || nvn_deswz_gpu_init(device)) return failed(@"error",@"bc_writer_deswizzler",error);
+    id<MTLCommandQueue> reader=[device newCommandQueue],uploader=[device newCommandQueue];
+    NvnBCTransfers *transfers=[[NvnBCTransfers alloc] initWithDevice:device readbackQueue:reader uploadQueue:uploader byteBudget:1<<20 jobBudget:2];
+    DmGpuMemory *owner=[DmGpuMemory new];owner.backing=BackingVM;owner.length=131072;
+    vm_address_t pages=0;
+    if (!transfers || vm_allocate(mach_task_self(),&pages,owner.length,VM_FLAGS_ANYWHERE)!=KERN_SUCCESS) return failed(@"error",@"bc_vm_allocation",nil);
+    owner.pointer=(void *)pages;memset(owner.pointer,0xCD,owner.length);
+    dm_vm_pool_region region;
+    if (dm_vm_pool_check(owner.pointer,owner.length,&region)!=KERN_SUCCESS || region.base!=pages || region.length!=owner.length)
+        return failed(@"error",@"bc_vm_region",nil);
+    MTLResourceOptions options=MTLResourceStorageModeShared|MTLResourceHazardTrackingModeUntracked;
+    result[@"stage"]=@"bc_wrap_writer";if (!publish(result)) return failed(@"error",@"result_persistence",nil);
+    id<MTLBuffer> original=[device newBufferWithBytesNoCopy:owner.pointer length:owner.length options:options
+        deallocator:^(void *memory,NSUInteger length){(void)memory;(void)length;(void)owner.length;}];
+    if (!nvn_buffer_identity(original,owner.pointer,owner.length,device)) return failed(@"error",@"bc_writer_identity",nil);
+    result[@"stage"]=@"bc_wrap_reader";if (!publish(result)) return failed(@"error",@"result_persistence",nil);
+    id<MTLBuffer> alias=[device newBufferWithBytesNoCopy:owner.pointer length:owner.length options:options
+        deallocator:^(void *memory,NSUInteger length){(void)memory;(void)length;(void)owner.length;}];
+    if (!nvn_buffer_identity(alias,owner.pointer,owner.length,device)) return failed(@"error",@"bc_reader_identity",nil);
+    if (original==alias || original.hazardTrackingMode!=MTLHazardTrackingModeUntracked || alias.hazardTrackingMode!=MTLHazardTrackingModeUntracked)
+        return failed(@"unsupported",@"bc_untracked_aliases",nil);
+    result[@"writer_hazard_mode"]=@(original.hazardTrackingMode);result[@"reader_hazard_mode"]=@(alias.hazardTrackingMode);
+    result[@"source_inspection"]=@"only_owned_GPU_readback_after_producer_event";
+    NSUInteger pixels=0;
+    for (uint32_t format=0x41;format<=0x50;format++) {
+        @autoreleasepool {
+            result[@"stage"]=@"bc_linear_encoding";result[@"format_pending"]=@(format);
+            if (!publish(result)) return failed(@"error",@"result_persistence",nil);
+            uint8_t expected[2][8];unsigned bpp=0;uint32_t pixelFormat;int pixelBytes;
+            if (!nvn_bc_unpacked(format,&pixelFormat,&pixelBytes)) return failed(@"error",@"bc_format",nil);
+            MTLTextureDescriptor *descriptor=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)pixelFormat width:7 height:5 mipmapped:NO];
+            descriptor.storageMode=MTLStorageModePrivate;descriptor.hazardTrackingMode=MTLHazardTrackingModeTracked;descriptor.usage=MTLTextureUsageShaderRead;
+            id<MTLTexture> textures[2]={[device newTextureWithDescriptor:descriptor],[device newTextureWithDescriptor:descriptor]};
+            id<MTLBuffer> observed=[device newBufferWithLength:3328 options:MTLResourceStorageModeShared];
+            id<MTLCommandBuffer> command=[queue commandBuffer];
+            if (!textures[0] || !textures[1] || !observed || !command) return failed(@"error",@"bc_linear_resources",nil);
+            memset(observed.contents,0xCD,observed.length);
+            for (unsigned variant=0;variant<2;variant++) {
+                uint8_t block[16];if (!nvn_bc_vector(format,variant,block,expected[variant],&bpp)) return failed(@"error",@"bc_vector",nil);
+                NSUInteger blockBytes=format==0x41 || format==0x42 || format==0x45 || format==0x46 || format==0x49 || format==0x4a?8:16;
+                NSUInteger row=2*blockBytes+8,image=2*row,extent=row+2*blockBytes;
+                id<MTLBuffer> seed=[device newBufferWithLength:extent options:MTLResourceStorageModeShared];
+                if (!seed) return failed(@"error",@"bc_seed",nil);
+                memset(seed.contents,0xEF,extent);
+                for (unsigned y=0;y<2;y++) for (unsigned x=0;x<2;x++) memcpy((uint8_t *)seed.contents+y*row+x*blockBytes,block,blockBytes);
+                id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];
+                if (!encoder) return failed(@"error",@"bc_writer_encoder",nil);
+                [encoder setComputePipelineState:writer];[encoder setBuffer:seed offset:0 atIndex:0];[encoder setBuffer:original offset:4 atIndex:1];
+                [encoder dispatchThreadgroups:MTLSizeMake(extent/4,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];[encoder endEncoding];
+                NvnBCRegion area={.width=7,.height=5,.depth=1,.sourceRow=row,.sourceImage=image};
+                if ([transfers encodeCommand:command source:alias offset:4 length:extent format:format regions:&area count:1 packaged:NULL destination:textures[variant]])
+                    return failed(@"error",@"bc_linear_admission",nil);
+            }
+            if (transfers.allocatedBytes || transfers.pendingJobs!=2) return failed(@"error",@"bc_deferred_staging",nil);
+            id<MTLBlitCommandEncoder> readback=[command blitCommandEncoder];
+            if (!readback) return failed(@"error",@"bc_result_encoder",nil);
+            for (unsigned variant=0;variant<2;variant++) [readback copyFromTexture:textures[variant] sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                sourceSize:MTLSizeMake(7,5,1) toBuffer:observed destinationOffset:variant*1536 destinationBytesPerRow:256 destinationBytesPerImage:1280];
+            [readback copyFromBuffer:original sourceOffset:0 toBuffer:observed destinationOffset:3072 size:4];
+            [readback copyFromBuffer:original sourceOffset:4092 toBuffer:observed destinationOffset:3076 size:4];[readback endEncoding];
+            dispatch_semaphore_t done=dispatch_semaphore_create(0);
+            [command addCompletedHandler:^(id<MTLCommandBuffer> completed){(void)completed;(void)original.length;(void)alias.length;(void)owner.length;dispatch_semaphore_signal(done);}];
+            result[@"stage"]=@"bc_linear_completion";if (!publish(result)) return failed(@"error",@"result_persistence",nil);
+            [command commit];
+            if (dispatch_semaphore_wait(done,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC))) return failed(@"timeout",@"bc_linear_completion",nil);
+            if (command.status!=MTLCommandBufferStatusCompleted) return failed(@"error",@"bc_linear_completion",command.error);
+            const uint8_t *actual=observed.contents;
+            for (unsigned variant=0;variant<2;variant++) for (unsigned y=0;y<5;y++) {
+                for (unsigned x=0;x<7;x++) if (memcmp(actual+variant*1536+y*256+x*bpp,expected[variant],bpp)) return failed(@"error",@"bc_linear_pixels",nil);
+                for (unsigned x=7*bpp;x<256;x++) if (actual[variant*1536+y*256+x]!=0xCD) return failed(@"error",@"bc_linear_row_guard",nil);
+            }
+            for (unsigned variant=0;variant<2;variant++) for (unsigned i=1280;i<1536;i++) if (actual[variant*1536+i]!=0xCD) return failed(@"error",@"bc_linear_tail_guard",nil);
+            for (unsigned i=3072;i<3328;i++) if (actual[i]!=0xCD) return failed(@"error",@"bc_source_result_guards",nil);
+            if (transfers.pendingJobs || transfers.allocatedBytes || transfers.reservedBytes) return failed(@"error",@"bc_linear_retirement",nil);
+            pixels+=70;result[@"linear_formats_completed"]=@(format-0x40);result[@"linear_pixels_checked"]=@(pixels);
+        }
+    }
+    @autoreleasepool {
+        result[@"stage"]=@"bc_packaged_volume_encoding";if (!publish(result)) return failed(@"error",@"result_persistence",nil);
+        nvn_texdesc descriptor={.target=2,.format=0x41,.width=7,.height=5,.depth=3,.levels=2};nvn_texlayout layout;nvn_tex_layout(&descriptor,&layout);
+        if (!layout.size || layout.size>owner.length-4) return failed(@"error",@"bc_packaged_layout",nil);
+        id<MTLBuffer> seed=[device newBufferWithLength:layout.size options:MTLResourceStorageModeShared];
+        if (!seed) return failed(@"error",@"bc_packaged_seed",nil);
+        memset(seed.contents,0xEF,seed.length);
+        NvnBCRegion areas[2];uint8_t expected[2][8];NSUInteger outputSize=0;
+        for (unsigned level=0;level<2;level++) {
+            uint32_t w=MAX(7u>>level,1u),h=MAX(5u>>level,1u),z=MAX(3u>>level,1u);
+            NSUInteger row=((w+3)/4)*8,image=row*((h+3)/4);uint8_t block[16];unsigned bpp;
+            nvn_bc_vector(0x41,level,block,expected[level],&bpp);
+            NSMutableData *linear=[NSMutableData dataWithLength:image*z];
+            for (NSUInteger at=0;at<linear.length;at+=8) memcpy((uint8_t *)linear.mutableBytes+at,block,8);
+            if (nvn_swizzle(&descriptor,level,0,linear.bytes,row,seed.contents)) return failed(@"error",@"bc_packaged_swizzle_fixture",nil);
+            areas[level]=(NvnBCRegion){.width=w,.height=h,.depth=z,.sourceRow=row,.sourceImage=image,.level=level,.sourceLevel=level};
+            outputSize+=256*h*z;
+        }
+        MTLTextureDescriptor *td=[MTLTextureDescriptor new];td.textureType=MTLTextureType3D;td.pixelFormat=MTLPixelFormatRGBA8Unorm;
+        td.width=7;td.height=5;td.depth=3;td.mipmapLevelCount=2;td.storageMode=MTLStorageModePrivate;td.hazardTrackingMode=MTLHazardTrackingModeTracked;td.usage=MTLTextureUsageShaderRead;
+        id<MTLTexture> texture=[device newTextureWithDescriptor:td];id<MTLBuffer> observed=[device newBufferWithLength:outputSize+256 options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> command=[queue commandBuffer];if (!texture || !observed || !command) return failed(@"error",@"bc_packaged_resources",nil);
+        memset(observed.contents,0xCD,observed.length);
+        id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];
+        if (!encoder) return failed(@"error",@"bc_packaged_writer_encoder",nil);
+        [encoder setComputePipelineState:writer];[encoder setBuffer:seed offset:0 atIndex:0];[encoder setBuffer:original offset:4 atIndex:1];
+        [encoder dispatchThreadgroups:MTLSizeMake(layout.size/4,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];[encoder endEncoding];
+        if ([transfers encodeCommand:command source:alias offset:4 length:layout.size format:0x41 regions:areas count:2 packaged:&descriptor destination:texture])
+            return failed(@"error",@"bc_packaged_admission",nil);
+        id<MTLBlitCommandEncoder> readback=[command blitCommandEncoder];if (!readback) return failed(@"error",@"bc_packaged_result_encoder",nil);
+        NSUInteger offset=0;
+        for (unsigned level=0;level<2;level++) {
+            [readback copyFromTexture:texture sourceSlice:0 sourceLevel:level sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(areas[level].width,areas[level].height,areas[level].depth)
+                toBuffer:observed destinationOffset:offset destinationBytesPerRow:256 destinationBytesPerImage:256*areas[level].height];
+            offset+=256*areas[level].height*areas[level].depth;
+        }
+        [readback endEncoding];dispatch_semaphore_t done=dispatch_semaphore_create(0);
+        [command addCompletedHandler:^(id<MTLCommandBuffer> completed){(void)completed;(void)original.length;(void)alias.length;(void)owner.length;dispatch_semaphore_signal(done);}];
+        result[@"stage"]=@"bc_packaged_volume_completion";if (!publish(result)) return failed(@"error",@"result_persistence",nil);
+        [command commit];if (dispatch_semaphore_wait(done,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC))) return failed(@"timeout",@"bc_packaged_volume_completion",nil);
+        if (command.status!=MTLCommandBufferStatusCompleted) return failed(@"error",@"bc_packaged_volume_completion",command.error);
+        const uint8_t *actual=observed.contents;offset=0;NSUInteger pixels=0;
+        for (unsigned level=0;level<2;level++) {
+            for (unsigned z=0;z<areas[level].depth;z++) for (unsigned y=0;y<areas[level].height;y++) {
+                for (unsigned x=0;x<areas[level].width;x++) if (memcmp(actual+offset+x*4,expected[level],4)) return failed(@"error",@"bc_packaged_pixels",nil);
+                for (unsigned x=areas[level].width*4;x<256;x++) if (actual[offset+x]!=0xCD) return failed(@"error",@"bc_packaged_row_guard",nil);
+                pixels+=areas[level].width;offset+=256;
+            }
+        }
+        for (NSUInteger i=outputSize;i<observed.length;i++) if (actual[i]!=0xCD) return failed(@"error",@"bc_packaged_tail_guard",nil);
+        result[@"packaged_pixels_checked"]=@(pixels);result[@"packaged_mips"]=@2;result[@"packaged_depth_slices"]=@4;
+    }
+    if (transfers.pendingJobs || transfers.allocatedBytes || transfers.reservedBytes || transfers.completedJobs!=33) return failed(@"error",@"bc_final_retirement",nil);
+    [result removeObjectForKey:@"format_pending"];result[@"completed_jobs"]=@(transfers.completedJobs);result[@"peak_staging_bytes"]=@(transfers.peakAllocatedBytes);
+    result[@"pending_jobs"]=@(transfers.pendingJobs);result[@"reserved_bytes"]=@(transfers.reservedBytes);result[@"allocated_bytes"]=@(transfers.allocatedBytes);
+    result[@"status"]=@"passed";result[@"stage"]=@"bc_readback_checked";return result;
 }
 
 static NSDictionary *private_depth(id<MTLDevice> device, id<MTLCommandQueue> queue, BOOL (^publish)(NSDictionary *)) {
@@ -711,6 +862,12 @@ int dm_gpu_probe(void) {
                 else if (!shared || ![queue respondsToSelector:@selector(addResidencySet:)]) tests[@"residency_set"] = failure(@"unsupported", @"queue_residency", nil);
                 else { [set addAllocation:shared]; [set commit]; [queue addResidencySet:set]; [queue removeResidencySet:set]; tests[@"residency_set"] = @{@"status": @"passed", @"queue_registration": @YES}; }
             }
+        }
+        if (selection == DM_GPU_CASE_BC || selection == DM_GPU_CASE_ALL) {
+            if (!begin_test(result,path,@"bc_transfers")) return 1;
+            tests[@"bc_transfers"]=bc_transfers(device,queue,^BOOL(NSDictionary *detail) {
+                tests[@"bc_transfers"]=detail;return write_report(result,path,NO);
+            });
         }
         if (selection == DM_GPU_CASE_ARGUMENTS || selection == DM_GPU_CASE_ALL) {
             if (!begin_test(result, path, @"prepared_arguments")) return 1;

@@ -6,12 +6,12 @@
 enum { DM_GPU_PROBE_WORDS = 64 };
 enum dm_gpu_probe_match { DM_GPU_PROBE_INVALID = -1, DM_GPU_PROBE_MISMATCH = 0, DM_GPU_PROBE_MATCH = 1 };
 enum dm_gpu_probe_case { DM_GPU_CASE_INVALID = -1, DM_GPU_CASE_CORE, DM_GPU_CASE_RESIDENCY,
-    DM_GPU_CASE_MALLOC, DM_GPU_CASE_VM, DM_GPU_CASE_SHARED, DM_GPU_CASE_ALIAS, DM_GPU_CASE_POOL, DM_GPU_CASE_CONSTANTS, DM_GPU_CASE_DEPTH, DM_GPU_CASE_ARGUMENTS, DM_GPU_CASE_ALL };
+    DM_GPU_CASE_MALLOC, DM_GPU_CASE_VM, DM_GPU_CASE_SHARED, DM_GPU_CASE_ALIAS, DM_GPU_CASE_POOL, DM_GPU_CASE_CONSTANTS, DM_GPU_CASE_DEPTH, DM_GPU_CASE_ARGUMENTS, DM_GPU_CASE_BC, DM_GPU_CASE_ALL };
 
 static inline enum dm_gpu_probe_case dm_gpu_probe_parse_case(const char *name) {
-    static const char *names[] = {"core", "residency", "nocopy-malloc", "nocopy-vm", "nocopy-shared", "buffer-alias", "protected-pool", "ordered-constants", "private-depth", "prepared-arguments", "all"};
+    static const char *names[] = {"core", "residency", "nocopy-malloc", "nocopy-vm", "nocopy-shared", "buffer-alias", "protected-pool", "ordered-constants", "private-depth", "prepared-arguments", "bc-transfers", "all"};
     if (!name) return DM_GPU_CASE_INVALID;
-    for (int i = 0; i < 11; i++) if (!strcmp(name, names[i])) return (enum dm_gpu_probe_case)i;
+    for (int i = 0; i < 12; i++) if (!strcmp(name, names[i])) return (enum dm_gpu_probe_case)i;
     return DM_GPU_CASE_INVALID;
 }
 
