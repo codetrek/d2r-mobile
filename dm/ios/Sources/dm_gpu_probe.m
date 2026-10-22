@@ -21,6 +21,7 @@
 #include "../../gfx/tex/nvn_deswizzle_gpu.h"
 #include "../../gfx/nvn/nvn_native_arguments.h"
 #include "dm_gpu_probe_checkpoint.h"
+#include "dm_profile_libraries.h"
 
 void plog(const char *format, ...);
 
@@ -834,10 +835,38 @@ int dm_gpu_probe(void) {
             result[@"error"] = @{@"stage": @"case_selection", @"description": @"unknown DM_GPU_PROBE_CASE"};
             write_report(result, path, NO); return 2;
         }
+        DmProfileLibraryPlan *libraryPlan = nil;
+        if (selection == DM_GPU_CASE_LIBRARIES) { @autoreleasepool {
+            NSError *error = nil;
+            libraryPlan = [DmProfileLibraryPlan loadRoot:NSBundle.mainBundle.resourcePath
+                                                 expected:dm_profile_library_expected() error:&error];
+            if (!libraryPlan) {
+                result[@"error"] = failure(@"error", @"profile_library_inventory", error);
+                write_report(result, path, NO); return 1;
+            }
+        }}
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (!device) { result[@"device_status"] = @"unavailable"; write_report(result, path, NO); return 1; }
         result[@"device_status"] = @"available"; result[@"device"] = device_info(device, device);
         NSMutableDictionary *tests = [NSMutableDictionary dictionary]; result[@"tests"] = tests;
+        if (selection == DM_GPU_CASE_LIBRARIES) {
+            if (!begin_test(result, path, @"profile_libraries")) return 1;
+            NSError *error = nil;
+            NSDictionary *receipt = dm_profile_library_run(libraryPlan, device, 1, 1800, 120, 30, ^BOOL(NSDictionary *detail) {
+                tests[@"profile_libraries"] = @{@"status": @"pending", @"receipt": detail};
+                return write_report(result, path, NO);
+            }, &error);
+            BOOL passed = receipt && dm_profile_library_receipt_complete(receipt, libraryPlan, [libraryPlan scopeForDevice:device]);
+            NSMutableDictionary *test = [@{@"status": passed ? @"passed" : @"error"} mutableCopy];
+            if (receipt) test[@"receipt"] = receipt;
+            if (error) test[@"error"] = error.localizedDescription;
+            tests[@"profile_libraries"] = test;
+            [result removeObjectForKey:@"pending_test"]; result[@"complete"] = @YES;
+            result[@"library_compilation_only"] = @YES;
+            result[@"guest_executed"] = @NO; result[@"gpu_commands_submitted"] = @NO;
+            if (!write_report(result, path, NO)) return 1;
+            return passed ? 0 : 1;
+        }
         if (!begin_test(result, path, @"shared_buffer")) return 1;
         id<MTLBuffer> shared = [device newBufferWithLength:0x4000 options:MTLResourceStorageModeShared];
         BOOL addressAPI = [shared respondsToSelector:@selector(gpuAddress)];

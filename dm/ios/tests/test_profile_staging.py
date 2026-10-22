@@ -93,10 +93,12 @@ class ProfileStagingTests(unittest.TestCase):
         snapshot.verify_package(package, {'files': expected}, {'executable'})
         (package / 'dm/simulator-metadata-profile.json').write_bytes(b'corrupt descriptor')
         with self.assertRaises(ValueError): snapshot.verify_package(package, {'files': expected}, {'executable'})
-        constants = profile_inputs.constants(result['chain'], result)
+        compiler = profile_inputs.library_contract_source(REPO)
+        constants = profile_inputs.constants(result['chain'], result, compiler_contract=compiler)
         self.assertIn('#define DM_SIMULATOR_PROFILE_ACTIVATED 0', constants)
         self.assertNotIn('#define DM_NVN_SIMULATOR ', constants)
         self.assertIn(descriptor['provenance_id'], constants)
+        self.assertIn(compiler, constants)
 
     def test_admission_rejects_wrong_interpreter_extra_descriptor_and_source_drift(self):
         self.fixture.produce()

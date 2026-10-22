@@ -170,10 +170,17 @@ def admit(source_root, canonical_cache, qualification, canonical_metadata, profi
     return result
 
 
-def constants(chain, admission):
+def library_contract_source(source_root):
+    names = ('dm/gfx/nvn/dm_metal_library.h', 'dm/gfx/nvn/dm_metal_library.m')
+    return hashlib.sha256(encoded({name: identity(Path(source_root) / name) for name in names})).hexdigest()
+
+
+def constants(chain, admission, *, compiler_contract):
     require(isinstance(chain, str) and re.fullmatch(r'[0-9a-f]{12}', chain), 'invalid generated shader chain')
+    require(isinstance(compiler_contract, str) and SHA.fullmatch(compiler_contract), 'explicit shared compiler source identity required')
     content = '#define DM_SHELL 1\n#define DM_NVN_M3 1\n#define DM_SIMULATOR_SHADER_CHAIN "' + chain + '"\n'
     content += '#define DM_SIMULATOR_PROFILE_ACTIVATED 0\n'
+    content += '#define DM_METAL_LIBRARY_CONTRACT_SHA256 "' + compiler_contract + '"\n'
     if admission is not None:
         for macro, value in [('DM_SIMULATOR_SOURCE_PROFILE', admission['source_profile']),
                              ('DM_SIMULATOR_METADATA_SHA256', admission['metadata_sha256']),

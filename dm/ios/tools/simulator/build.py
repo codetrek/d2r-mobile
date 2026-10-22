@@ -291,7 +291,8 @@ def build(args):
     config = config.replace('HEADER_SEARCH_PATHS = $(inherited) ',
                             'HEADER_SEARCH_PATHS = $(inherited) "' + str(root / 'Gen/include') + '" ', 1)
     config += 'OTHER_LDFLAGS = $(inherited) $(DM_FRAMEWORKS)\n'
-    profile = frozen_profiles.constants(chain, admission)
+    profile = frozen_profiles.constants(chain, admission,
+                                         compiler_contract=frozen_profiles.library_contract_source(source_root))
     for name, content in (('dm.xcconfig', config), ('profile.h', profile)):
         data = content.encode()
         generated_bindings[name] = dict(size=len(data), sha256=hashlib.sha256(data).hexdigest())

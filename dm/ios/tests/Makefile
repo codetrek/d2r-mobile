@@ -7,6 +7,10 @@ METAL_CACHE_TARGET = t_metal_cache_guard
 GPU_PROBE_TARGET = ../../../.tmp/ios-tests/t_gpu_probe_result
 GPU_CHECKPOINT_TARGET = ../../../.tmp/ios-tests/t_gpu_probe_checkpoint
 GPU_MEMORY_TARGET = ../../../.tmp/ios-tests/t_gpu_probe_memory
+PROFILE_LIBRARY_TARGET = ../../../.tmp/ios-tests/t_profile_libraries
+PROFILE_LIBRARY_SOURCE = ../Sources/dm_profile_libraries.m
+PROFILE_LIBRARY_HELPER = ../../../.tmp/ios-tests/dm_metal_library_owned_io.o
+PROFILE_LIBRARY_FLAGS = -std=c23 -fobjc-arc -fblocks -DDM_METAL_LIBRARY_CONTRACT_SHA256='"$(shell $(PYTHON) ../tools/simulator/library_contract.py)"'
 BINDING_TARGETS = t_native_binding t_game_bridge t_binding_freshness t_portal_sequence t_binding_group t_native_hud_identity t_native_hud_bridge
 BINDING_FIXTURES = fixtures/native_binding/mapping.bin fixtures/native_binding/bindings.bin
 # 这两份夹具是从运行中的游戏内存抓下来的两张表，公开仓库不带（见 fixtures/native_binding/README）。不在就跳过要读它们的三个测试并说明，别的照跑
@@ -14,13 +18,21 @@ BINDING_FIXTURES = fixtures/native_binding/mapping.bin fixtures/native_binding/b
 HAVE_BINDING_FIXTURES := $(and $(wildcard fixtures/native_binding/mapping.bin),$(wildcard fixtures/native_binding/bindings.bin))
 fixture_test = $(if $(HAVE_BINDING_FIXTURES),./$(1) $(BINDING_FIXTURES),@echo "跳过 $(1)：没有夹具 $(BINDING_FIXTURES)（公开仓库不带，要自己从运行中的游戏抓，见 fixtures/native_binding/README）")
 
-.PHONY: all run test clean profile-metadata profile-staging
+.PHONY: all run test clean profile-metadata profile-staging profile-libraries
 all: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET) $(GPU_PROBE_TARGET) $(GPU_CHECKPOINT_TARGET) $(GPU_MEMORY_TARGET)
 run: test
 profile-metadata:
 	$(PYTHON) test_profile_metadata.py
 profile-staging:
 	$(PYTHON) test_profile_staging.py
+profile-libraries: $(PROFILE_LIBRARY_TARGET)
+	$(PROFILE_LIBRARY_TARGET) ../../../.tmp/ios-tests/profile-library-fixture
+$(PROFILE_LIBRARY_TARGET): t_profile_libraries.m $(PROFILE_LIBRARY_SOURCE) $(PROFILE_LIBRARY_HELPER) ../Sources/dm_profile_libraries.h ../Sources/dm_shader_prep_gate.h ../../gfx/nvn/dm_metal_library.h ../tools/simulator/profile_inputs.py ../tools/simulator/library_contract.py
+	mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(PROFILE_LIBRARY_FLAGS) t_profile_libraries.m $(PROFILE_LIBRARY_SOURCE) $(PROFILE_LIBRARY_HELPER) -framework Foundation -framework Metal -o $@
+$(PROFILE_LIBRARY_HELPER): ../../gfx/nvn/dm_metal_library.m ../../gfx/nvn/dm_metal_library.h ../tools/simulator/profile_inputs.py ../tools/simulator/library_contract.py
+	mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(PROFILE_LIBRARY_FLAGS) -Dmmap=dm_owned_mmap -c ../../gfx/nvn/dm_metal_library.m -o $@
 $(TARGET): t_touch_controls.c $(wildcard ../Sources/dm_touch_controls.[ch]) ../../host/dm_input.h
 	$(CC) $(CFLAGS) -I../Sources t_touch_controls.c ../Sources/dm_touch_controls.c -lm -o $@
 t_native_binding: t_native_binding.c ../Sources/dm_touch_game_state.c ../Sources/dm_touch_game_state.h ../Sources/dm_touch_controls.c ../Sources/dm_touch_controls.h
@@ -56,13 +68,14 @@ $(GPU_PROBE_TARGET): t_gpu_probe_result.c ../Sources/dm_gpu_probe_result.h
 $(GPU_CHECKPOINT_TARGET): t_gpu_probe_checkpoint.m ../Sources/dm_gpu_probe_checkpoint.h
 	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fobjc-arc -fblocks t_gpu_probe_checkpoint.m -framework Foundation -o $@
-$(GPU_MEMORY_TARGET): t_gpu_probe_memory.m ../Sources/dm_gpu_probe.m ../Sources/dm_gpu_probe_result.h ../Sources/dm_gpu_probe_checkpoint.h ../../host/dm_vm.h ../../host/dm_vm_leases.h ../../gfx/nvn/nvn_buffer_identity.h ../../gfx/nvn/nvn_ordered_constants.h ../../gfx/nvn/nvn_ordered_constants.m ../../gfx/nvn/nvn_depth_dummy.h ../../gfx/nvn/nvn_depth_dummy.m ../../gfx/nvn/nvn_prepared_arguments.h ../../gfx/nvn/nvn_prepared_arguments.m ../../gfx/nvn/nvn_native_arguments.h ../../gfx/nvn/nvn_bc_transfer.h ../../gfx/nvn/nvn_bc_transfer.m ../../gfx/tex/nvn_bc_vectors.h ../../gfx/tex/nvn_bcdec.h ../../gfx/tex/nvn_bcdec.c ../../gfx/tex/nvn_deswizzle.h ../../gfx/tex/nvn_deswizzle.c ../../gfx/tex/nvn_deswizzle_gpu.h ../../gfx/tex/nvn_deswizzle_gpu.m ../../gfx/nvn/nvn_tex.h ../../gfx/nvn/nvn_tex.c ../../third_party/bcdec/bcdec.h
+$(GPU_MEMORY_TARGET): t_gpu_probe_memory.m ../Sources/dm_gpu_probe.m ../Sources/dm_gpu_probe_result.h ../Sources/dm_gpu_probe_checkpoint.h ../../host/dm_vm.h ../../host/dm_vm_leases.h ../../gfx/nvn/nvn_buffer_identity.h ../../gfx/nvn/nvn_ordered_constants.h ../../gfx/nvn/nvn_ordered_constants.m ../../gfx/nvn/nvn_depth_dummy.h ../../gfx/nvn/nvn_depth_dummy.m ../../gfx/nvn/nvn_prepared_arguments.h ../../gfx/nvn/nvn_prepared_arguments.m ../../gfx/nvn/nvn_native_arguments.h ../../gfx/nvn/nvn_bc_transfer.h ../../gfx/nvn/nvn_bc_transfer.m ../../gfx/tex/nvn_bc_vectors.h ../../gfx/tex/nvn_bcdec.h ../../gfx/tex/nvn_bcdec.c ../../gfx/tex/nvn_deswizzle.h ../../gfx/tex/nvn_deswizzle.c ../../gfx/tex/nvn_deswizzle_gpu.h ../../gfx/tex/nvn_deswizzle_gpu.m ../../gfx/nvn/nvn_tex.h ../../gfx/nvn/nvn_tex.c ../../third_party/bcdec/bcdec.h ../Sources/dm_profile_libraries.h ../Sources/dm_profile_libraries.m ../../gfx/nvn/dm_metal_library.h ../../gfx/nvn/dm_metal_library.m
 	mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -std=c23 -fobjc-arc -fblocks t_gpu_probe_memory.m ../../gfx/nvn/nvn_ordered_constants.m ../../gfx/nvn/nvn_depth_dummy.m ../../gfx/nvn/nvn_prepared_arguments.m ../../gfx/nvn/nvn_bc_transfer.m ../../gfx/tex/nvn_bcdec.c ../../gfx/tex/nvn_deswizzle.c ../../gfx/tex/nvn_deswizzle_gpu.m ../../gfx/nvn/nvn_tex.c -framework Foundation -framework Metal -o $@
-test: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET) $(GPU_PROBE_TARGET) $(GPU_CHECKPOINT_TARGET) $(GPU_MEMORY_TARGET)
+	$(CC) $(CFLAGS) -std=c23 -fobjc-arc -fblocks t_gpu_probe_memory.m ../../gfx/nvn/nvn_ordered_constants.m ../../gfx/nvn/nvn_depth_dummy.m ../../gfx/nvn/nvn_prepared_arguments.m ../../gfx/nvn/nvn_bc_transfer.m ../../gfx/tex/nvn_bcdec.c ../../gfx/tex/nvn_deswizzle.c ../../gfx/tex/nvn_deswizzle_gpu.m ../../gfx/nvn/nvn_tex.c ../Sources/dm_profile_libraries.m ../../gfx/nvn/dm_metal_library.m -framework Foundation -framework Metal -o $@
+test: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET) $(GPU_PROBE_TARGET) $(GPU_CHECKPOINT_TARGET) $(GPU_MEMORY_TARGET) $(PROFILE_LIBRARY_TARGET)
 	$(GPU_PROBE_TARGET)
 	$(GPU_CHECKPOINT_TARGET)
 	$(GPU_MEMORY_TARGET)
+	$(PROFILE_LIBRARY_TARGET) ../../../.tmp/ios-tests/profile-library-fixture
 	python3 test_simulator.py
 	python3 test_pso_native.py
 	$(PYTHON) test_profile_metadata.py

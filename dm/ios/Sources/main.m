@@ -29,6 +29,7 @@ void dm_host_shutdown(const char *why);   // 宿主优雅退出（dm/host/hle_li
 static NSString *T(const char *k) { return @(dm_ui(k)); }   // 我们自己的界面文字（中英表 dm/i18n/ui_text.tsv，语言跟原版设置走） | our own UI text (Chinese-English string table dm/i18n/ui_text.tsv, language follows the original game's setting)
 #import <Network/Network.h>
 #include "dm_metal_cache_guard.h"
+#include "dm_shader_prep_gate.h"
 
 #if __IPHONE_OS_VERSION_MAX_ALLOWED < 260400
 // Xcode 26.2 的 SDK 没有这两个方法的声明，这里只补声明；运行时仍要求 iOS 26.4。
@@ -762,7 +763,13 @@ static void host_start(void) {
 #ifdef DM_SHELL
     // 壳：着色器是以源码进包的话，进游戏之前先一次编完（dm_shader_prep.m，带进度页）；做完它回头再调这里
     // Shell: if the shaders are shipped as source in the package, compile them all in one go before entering the game (dm_shader_prep.m, with a progress page); when done it calls back here
-    { extern int dm_shader_prep_begin(void (^)(void)); static int asked; if (!asked) { asked = 1; if (dm_shader_prep_begin(^{ host_start(); })) return; } }
+    { extern int dm_shader_prep_begin(void (^)(void)); static DmShaderPrepState preparation;
+      DmShaderPrepDecision decision = dm_shader_prep_enter(&preparation);
+      if (decision == DmPrepWait) return;
+      if (decision == DmPrepStart) {
+          if (dm_shader_prep_begin(^{ dm_shader_prep_ready(&preparation); host_start(); })) return;
+          dm_shader_prep_ready(&preparation);
+      } }
 #endif
     g_host_up = 1; plog("boot: 场景到前台，起宿主（进程已活 %.1f ms）", since_start());
     { const char *mw = getenv("DM_TEST_MEMWARN");   // 测试开关 DM_TEST_MEMWARN=<秒>：起宿主后这么多秒，照系统的调法调一次内存告警回调（验那一行日志；系统真发告警的时机造不出来） | test switch DM_TEST_MEMWARN=<seconds>: this many seconds after the host starts, call the memory-warning callback once the way the system does (to check that log line; the moment the system really sends a warning cannot be staged)

@@ -25,7 +25,7 @@
 
 通过验证后，只按准入结果暂存全部基础 `_b.json` 和保存真实 MSL 源码的 `_b.metallib`，不生成、重命名或复制 BF。映射表、真实 C1、过滤后的有序 PSO 按元数据描述文件绑定的字节暂存。包内另携带 `dm/simulator-shader-profile.json` 和 `dm/simulator-metadata-profile.json`；前者是完整源输入的来源描述，包内暂存的是经核对的基础 JSON/源码库子集，完整原始/派生输入身份保存在构建清单中。
 
-生成的 `profile.h` 绑定独立链、源码配置、元数据 SHA-256/逻辑身份，并写明 `DM_SIMULATOR_PROFILE_ACTIVATED=0`。生成文件、两个描述文件和资源从源快照到暂存、链接后复制、普通签名后的最终整包都沿用同一份预声明身份。`d2r.ios-simulator-build.v3` 清单记录模式、CPU 准入、隔离工具/解释器、输入与资源、生成常量及最终文件清单，状态保持 `built_unexecuted`、`renderer_profile_activated=false`。
+生成的 `profile.h` 绑定独立链、源码配置、元数据 SHA-256/逻辑身份，并写明 `DM_SIMULATOR_PROFILE_ACTIVATED=0`；共享库编译器的实际 `.h/.m` 身份绑定为 `DM_METAL_LIBRARY_CONTRACT_SHA256`。生成文件、两个描述文件和资源从源快照到暂存、链接后复制、普通签名后的最终整包都沿用同一份预声明身份。`d2r.ios-simulator-build.v3` 清单记录模式、CPU 准入、隔离工具/解释器、输入与资源、生成常量及最终文件清单，状态保持 `built_unexecuted`、`renderer_profile_activated=false`。
 
 ## 命令与检查
 
@@ -59,4 +59,4 @@ make -C dm/ios/tests profile-staging PYTHON=python3.13
 
 检查包含实际隔离 CPU 验证器、冻结源不变、解释器/ABI/闭包负例、基础成对覆盖、BF/链拒绝、复制末尾损坏/多文件、元数据描述配对与身份，以及链接后资源复制/整包描述文件篡改。实际 6,927 键及元数据03另进行冻结输入准入和构建资源准备证明；准备证明不是应用编译、GPU、游戏或预热回执。
 
-源码预热的共享编译契约、用户 PSO 缓存隔离、全部 Metal 原生参数/PSO、真实渲染和游戏世界仍需后续整合与独立运行证明。服务端联机逻辑的部署不依赖这份客户端模拟器界面或图形验证工具。
+共享库编译契约与严格库专用准备已有源码和 CPU 证明，见 [共享库准备](LIBRARY_PREPARATION.md)。实际全部库/函数、用户 PSO 缓存隔离、Metal 原生参数/PSO、真实渲染和世界仍需后续整合与独立运行证明。服务端联机逻辑的部署不依赖这份客户端模拟器界面或图形验证工具。
